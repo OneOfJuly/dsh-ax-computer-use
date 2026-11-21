@@ -84,3 +84,9 @@
 - **稳法已验证**：下拉选项用 {"op":"click","text":"选项名"}（树定位 frame 中心 HID），
   关键 field 点后 read 验证 v=；快捷按钮（纯数字无标签）点后必须 read 校验数值。
 - 关闭表单验证法：axtree --text 添加工时 归零 = modal 已关。
+
+### 2026-11-21 微信 WeChat（腾讯自绘 UI，pid 21304 时代）
+- ❌ AX 树：全空（6 节点 3 个无标题按钮）——自绘 UI，AX 路线死。
+- ✅ 视觉坐标 HID 点击 + CGEvent 中文 type（postToPid 键盘进微信）+ return 触发搜索/发送。
+- 流程（4 轮 ~1 分钟）：点搜索框 → type 姓名 → return（自动进第一个结果会话）
+  → 点输入框 → type 消息 → return 发送。截图确认每步渲染。
