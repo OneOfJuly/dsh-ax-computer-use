@@ -70,3 +70,9 @@
 - ✅ axc 引擎 DSH bash 下辅助功能/屏幕录制权限全通（探针验证）。
 - ❌ swiftc 默认 module cache 路径（/var/folders）沙箱拒 → 必须 -module-cache-path 指向 workspace。
 - ❌ 沙箱禁写 ~/.ssh（known_hosts 警告无害）、禁直接 cp 进 DSH profile（用 install_bundle file: 刷新）。
+
+### v0.1.1 批量实测（2026-11-21）
+- TextEdit 全任务（新建+三行输入+全选+菜单加粗+验证）：2 轮调用 2.8s 引擎时间
+  （对比逐步模式 5-6 轮 ~45s）。提速=砍轮数，引擎只占 ~3s。
+- 飞书填工时预估：15-18 轮 → 3-4 轮，3 分钟 → ~1 分钟。
+- 用法：一条 ax_act 打包全部动作+内联 read 验证；最终确认只截一张图。
