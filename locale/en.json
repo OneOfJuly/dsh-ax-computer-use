@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "AX Computer Use",
+    "description": "AX-first Mac computer use for DSH: read the accessibility tree, run batched verified actions in one round-trip, compact screenshots, Electron relaunch. An order of magnitude fewer round-trips than vision-only clicking."
+  }
+}

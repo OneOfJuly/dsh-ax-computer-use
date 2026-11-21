@@ -1,0 +1,45 @@
+{
+  "name": "dsh-ax-computer-use",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "AX-first Mac computer use for DSH: accessibility tree reading, batched verified actions, compact screenshots, Electron relaunch. 10x fewer round-trips than vision-only clicking.",
+  "license": "MIT",
+  "author": "guoshengqiang",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./icon.svg": "./icon.svg",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "bin",
+    "locale",
+    "icon.svg",
+    "package.json"
+  ],
+  "icon": "./icon.svg",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "github:OneOfJuly/dsh-ax-computer-use"
+  },
+  "homepage": "https://github.com/OneOfJuly/dsh-ax-computer-use#readme",
+  "bugs": {
+    "url": "https://github.com/OneOfJuly/dsh-ax-computer-use/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "computer-use",
+    "accessibility",
+    "macos",
+    "automation",
+    "ax"
+  ]
+}

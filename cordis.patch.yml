@@ -1,0 +1,4 @@
+# Bundle patch for dsh-ax-computer-use: inserts the plugin row into the DSH profile.
+- insert:
+    - id: ax-computer-use
+      name: 'dsh-ax-computer-use'
