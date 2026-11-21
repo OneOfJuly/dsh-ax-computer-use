@@ -120,6 +120,8 @@ export function apply(ctx, _config) {
       parameters: {
         pid: { type: 'integer', required: true, description: '目标进程 pid（来自 ax_windows）' },
         actions: { type: 'string', required: true, description: 'JSON 数组，如 [{"op":"set","text":"用户名","value":"tom"},{"op":"press","text":"登录","role":"AXButton"}]' },
+        abort_on_error: { type: 'integer', description: '默认 1：任一动作 suspected_noop/ERR 立即中止剩余动作并报 ABORTED at action[N]（防连锁错点）。传 0 关闭。' },
+        abort_on_unverified: { type: 'integer', description: '1 = 更严格：unverified 结果也中止（网页关键提交前用）。' },
       },
       output: textOutput,
       presentCall: present('AX 批量动作'),
@@ -127,7 +129,10 @@ export function apply(ctx, _config) {
         let actions = String(args.actions ?? '').trim()
         if (!actions.startsWith('[')) actions = `[${actions}]`
         JSON.parse(actions) // validate before spawning
-        const out = await run(engine, ['axact', '--pid', String(args.pid), '--json', actions], 120000)
+        const extra = []
+        if (args.abort_on_error === 0) extra.push('--abort_on_error', '0')
+        if (args.abort_on_unverified === 1) extra.push('--abort_on_unverified', '1')
+        const out = await run(engine, ['axact', '--pid', String(args.pid), '--json', actions, ...extra], 120000)
         return { text: out }
       },
     }),
