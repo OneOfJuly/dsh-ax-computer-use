@@ -787,6 +787,12 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
         return "OK waited \(idx)\(ms)ms"
     case "ocr":
         let hits = ocrMatches(pid: pid, winIdx: a["win"] as? Int, filter: a["text"] as? String)
+        if (a["assert_absent"] as? Int ?? 0) == 1 {
+            // verifier polarity for "did the dialog close": absence is SUCCESS here — but only if the window is visible
+            guard pickWindow(Int(pid)) != nil else { throw ActError(msg: "window not on screen — cannot assert absence") }
+            guard hits.isEmpty else { throw ActError(msg: "ASSERT ABSENT FAIL «\(a["text"] ?? "")» still on screen (\(hits.count) hit(s))") }
+            return "OK \(idx)absent «\(a["text"] ?? "")» — confirmed not on screen"
+        }
         guard !hits.isEmpty else { throw ActError(msg: "no OCR text found (window hidden/minimized?)") }
         var lines: [String] = []
         for h in hits.prefix(25) { lines.append("«\(esc(h.text, 40))»@(\(Int(h.cx)),\(Int(h.cy)))") }
@@ -933,6 +939,13 @@ func ocrMatches(pid: Int32, winIdx: Int?, filter: String?) -> [OcrHit] {
 func ocrCmd(args: [String: String]) {
     guard let pid = Int32(args["pid"] ?? "") else { print("ERR bad pid"); exit(2) }
     let hits = ocrMatches(pid: pid, winIdx: nil, filter: args["text"])
+    if (args["assert-absent"] ?? "0") == "1" {
+        // absence only means "gone" if the window is actually visible — else it's just blindness
+        guard pickWindow(Int(pid)) != nil else { print("ERR window not on screen — cannot assert absence"); exit(1) }
+        guard hits.isEmpty else { print("ERR «\(args["text"] ?? "")» still on screen (\(hits.count) hit(s))"); exit(1) }
+        print("OK absent «\(args["text"] ?? "")»")
+        return
+    }
     if hits.isEmpty { print("ERR no OCR text found (window hidden/minimized?)"); exit(1) }
     for h in hits.prefix(60) {
         print("HIT «\(h.text)» center=(\(Int(h.cx)),\(Int(h.cy))) size=(\(Int(h.w))×\(Int(h.h))) conf=\(String(format: "%.2f", h.conf))")
@@ -968,15 +981,18 @@ func relaunch(args: [String: String]) {
     let ws = NSWorkspace.shared
     let running = ws.runningApplications.first { $0.localizedName == name || $0.bundleURL?.lastPathComponent == "\(name).app" }
     if let r = running {
-        r.terminate()
-        var gone = false
-        for _ in 0..<32 { if r.isTerminated { gone = true; break }; usleep(250000) }
-        if !gone {
-            // SIGTERM ignored — force kill, else old instance lingers and args never take effect
-            kill(r.processIdentifier, SIGKILL)
-            for _ in 0..<12 { if r.isTerminated { gone = true; break }; usleep(250000) }
-            guard gone else { print("ERR \(name) pid=\(r.processIdentifier) refuses to die (SIGTERM+SIGKILL both failed) — not relaunching"); exit(1) }
-        }
+        // zombie guard: NSWorkspace keeps stale entries for exited apps — probe the pid first
+        if kill(r.processIdentifier, 0) == 0 {
+            r.terminate()
+            var gone = false
+            for _ in 0..<32 { if kill(r.processIdentifier, 0) != 0 { gone = true; break }; usleep(250000) }
+            if !gone {
+                // SIGTERM ignored — force kill; stale entries never flip isTerminated, so probe the pid
+                kill(r.processIdentifier, SIGKILL)
+                for _ in 0..<12 { if kill(r.processIdentifier, 0) != 0 { gone = true; break }; usleep(250000) }
+                guard gone else { print("ERR \(name) pid=\(r.processIdentifier) refuses to die (SIGTERM+SIGKILL both failed) — not relaunching"); exit(1) }
+            }
+        } // else: stale entry for an exited app — nothing to kill, just launch
     }
     usleep(500000)
     let cfg = NSWorkspace.OpenConfiguration()
@@ -986,13 +1002,30 @@ func relaunch(args: [String: String]) {
     ws.openApplication(at: url, configuration: cfg) { _, err in
         if let err = err { print("ERR open: \(err.localizedDescription)") }
     }
-    // wait for pid
-    for _ in 0..<40 {
+    // wait for pid — first launch after a kill can register slowly with NSWorkspace
+    for _ in 0..<60 {
         usleep(250000)
-        if let r = ws.runningApplications.first(where: { $0.bundleURL == url && $0.processIdentifier > 0 && !$0.isTerminated }) {
+        if let r = ws.runningApplications.first(where: { ($0.bundleURL?.path == url.path || $0.localizedName == name) && $0.processIdentifier > 0 && !$0.isTerminated }) {
             print("OK relaunched \(name) pid=\(r.processIdentifier) args=\(extraArgs.joined(separator: " "))")
             return
         }
+    }
+    // NSWorkspace sometimes never lists it — fall back to pgrep on the bundle executable
+    let execName = (NSDictionary(contentsOf: url.appendingPathComponent("Contents/Info.plist"))?["CFBundleExecutable"] as? String)
+        ?? url.deletingPathExtension().lastPathComponent
+    let pg = Process()
+    pg.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    pg.arguments = ["-x", execName]
+    let pipe = Pipe()
+    pg.standardOutput = pipe
+    pg.standardError = FileHandle.nullDevice
+    try? pg.run()
+    pg.waitUntilExit()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    let first = String(data: data, encoding: .utf8)?.split(separator: "\n").first
+    if let pidStr = first, let newPid = Int32(pidStr.trimmingCharacters(in: .whitespaces)) {
+        print("OK relaunched \(name) pid=\(newPid) (via pgrep \(execName)) args=\(extraArgs.joined(separator: " "))")
+        return
     }
     print("ERR \(name) did not come up")
 }
