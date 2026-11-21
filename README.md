@@ -2,9 +2,16 @@
 
 [English](README.md) | [中文](README.zh.md)
 
-**AX-first computer use for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) on macOS** — the agent reads the macOS Accessibility tree instead of staring at screenshots, acts in **batched, machine-verified steps**, and only falls back to vision when pixels are genuinely needed.
+**Universal computer use for macOS, AX-first** — for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). The agent reads the macOS Accessibility tree instead of staring at screenshots, acts in **batched, machine-verified steps**, and only falls back to vision when pixels are genuinely needed. Works across **every category of Mac app**, not just one:
 
-Six tools: `ax_windows` / `ax_tree` / `ax_act` / `ax_read` / `ax_shot` / `ax_relaunch`.
+| App category | Example | Channel that works | Verified in the wild |
+|---|---|---|---|
+| Native AppKit | TextEdit, Finder, most system apps | full AX: read tree, `AXSetValue` write-back, menu traversal | end-to-end |
+| Chromium browsers | Chrome, Edge, multi-window multi-display | renderer AX tree + HID-grade clicks | bilibili episode panel on a 2-display setup |
+| Electron / CEF embeds | Lark/Feishu, Slack, VS Code webviews | forced-renderer-AX relaunch + visual coords + inline verify | 5-field enterprise form with antd dropdowns |
+| Self-drawn UIs (empty AX) | WeChat, game launchers, kiosk apps | screenshot → coords → HID click + CGEvent CJK typing | IM message sent in 4 rounds |
+
+Six tools: `ax_windows` / `ax_tree` / `ax_act` / `ax_read` / `ax_shot` / `ax_relaunch`. Task recipes for each category live in [skills/](skills/).
 
 <p align="center">
   <a href="assets/bilibili-episode-panel.jpg"><img src="assets/bilibili-episode-panel.jpg" width="560" alt="A web page read as an accessibility tree and driven by HID-grade clicks"></a>
@@ -37,7 +44,7 @@ Measured on real tasks: a form-filling workflow in a CEF-based enterprise web ap
 
 - `set` / `type` — write via `AXSetValue`, then **read the value back**; append targets the focused element's current value so partial writes are visible.
 - `press` — checks the element's `AXActions` list, falls back through checkbox value-toggle, and for web elements detects the "AXPress accepted but nothing happened" trap (renderer accessibility half-active) and **reports `unverified` instead of pretending**; optional HID-grade click fallback.
-- `click` — HID-level global click with a **frontmost-app guard**: if the target app isn't frontmost, it activates first and appends `WARN_FRONT` when the click would have landed on the wrong window.
+- `click` — HID-level global click with a **frontmost-app guard**: if the target app isn't frontmost, it activates first and appends `WARN_FRONT` when the click would have landed on the wrong window. Optional **inline verify guard** (`"verify":{"path":…,"contains":"…"}`) reads the target's value back after the click and **aborts the remaining batch** on mismatch — a wrong dropdown pick stops the chain instead of poisoning every field after it.
 - `menu` — walks native menu hierarchies (including the AXMenu-as-children quirk), falls back to reporting the item's keyboard shortcut.
 - Every batch reports `FOCUS before→after`, `FOCUSPATH`, and a **window-list diff** (`WINDOWS` — new/closed/retitled windows), so side effects surface immediately.
 

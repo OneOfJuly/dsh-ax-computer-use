@@ -2,9 +2,16 @@
 
 [English](README.md) | [中文](README.zh.md)
 
-**面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（macOS）的 AX-first 电脑操作插件** —— 让智能体直接读 macOS 无障碍树来"看"屏幕，以**批量、机器验证**的方式执行动作，只在真正需要像素时才退回截图。
+**面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（macOS）的通用 AX-first 电脑操作插件** —— 让智能体直接读 macOS 无障碍树来"看"屏幕，以**批量、机器验证**的方式执行动作，只在真正需要像素时才退回截图。覆盖**所有类型的 Mac 应用**，不限于某一类：
 
-六个工具：`ax_windows` / `ax_tree` / `ax_act` / `ax_read` / `ax_shot` / `ax_relaunch`。
+| 应用类型 | 例子 | 有效通道 | 实测 |
+|---|---|---|---|
+| 原生 AppKit | 文本编辑、Finder、多数系统应用 | 完整 AX：读树、AXSetValue 写回、菜单遍历 | 端到端 ✅ |
+| Chromium 浏览器 | Chrome、Edge、多窗口多显示器 | 渲染器 AX 树 + HID 级点击 | 双屏 bilibili 选集面板 ✅ |
+| Electron / CEF 内嵌 | 飞书/Lark、Slack、VS Code webview | 强制渲染器 AX 重启 + 视觉坐标 + 内联 verify | 5 字段企业表单（antd 下拉）✅ |
+| 自绘 UI（AX 树为空） | 微信、游戏启动器、kiosk 应用 | 截图→坐标→HID 点击 + CGEvent 中文键入 | IM 发消息 4 轮 ✅ |
+
+六个工具：`ax_windows` / `ax_tree` / `ax_act` / `ax_read` / `ax_shot` / `ax_relaunch`。各类型的任务配方见 [skills/](skills/)。
 
 <p align="center">
   <a href="assets/bilibili-episode-panel.jpg"><img src="assets/bilibili-episode-panel.jpg" width="560" alt="网页内容以无障碍树文本读取并用 HID 级点击驱动"></a>
@@ -37,7 +44,7 @@
 
 - `set` / `type` —— 走 `AXSetValue` 写入后**读回值核对**；追加写入对准焦点元素当前值，写了一半一眼可见。
 - `press` —— 查元素 `AXActions` 列表，依次降级勾选框翻转；对网页元素专门识别"AXPress 返回成功但啥也没发生"的陷阱（渲染器无障碍半激活态），**如实报 `unverified` 而不是假装成功**；可选 HID 级点击兜底。
-- `click` —— HID 级全局点击，带**前台应用守卫**：目标应用不在前台时先激活，仍不对就追加 `WARN_FRONT`，避免点击落到错误窗口上。
+- `click` —— HID 级全局点击，带**前台应用守卫**：目标应用不在前台时先激活，仍不对就追加 `WARN_FRONT`，避免点击落到错误窗口上。可选**内联 verify 守卫**（`"verify":{"path":…,"contains":"…"}`）：点击后自动读回目标值，不匹配**立即中止剩余批量动作**——下拉选错时链条当场停下，而不是污染后面的所有字段。
 - `menu` —— 下钻原生菜单层级（包括"菜单以 AXChildren 暴露"的怪癖），叶子节点回退为报告快捷键。
 - 每批动作汇报 `FOCUS before→after`、`FOCUSPATH`、**窗口清单 diff**（`WINDOWS`——新增/关闭/改标题），副作用立即浮出水面。
 

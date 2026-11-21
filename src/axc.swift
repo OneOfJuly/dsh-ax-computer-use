@@ -297,6 +297,8 @@ let KEYCODES: [String: UInt16] = [
     "home": 115, "end": 119, "pageup": 116, "pagedown": 121, "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96,
 ]
 
+func ksrc() -> CGEventSource { CGEventSource(stateID: .combinedSessionState)! }
+
 func flags(_ mods: [String]) -> CGEventFlags {
     var f: CGEventFlags = []
     for m in mods {
@@ -312,7 +314,18 @@ func flags(_ mods: [String]) -> CGEventFlags {
     return f
 }
 
-func postKey(_ pid: pid_t, _ spec: String) -> Bool {
+func frontGuard(_ pid: pid_t) {
+    let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    guard front != pid else { return }
+    activateApp(pid, AXUIElementCreateApplication(pid))
+    usleep(500000)
+    let front2 = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    if front2 != pid {
+        frontWarnStore = " WARN_FRONT pid=\(front2 ?? -1) '\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "?")' — HID input may land elsewhere!"
+    }
+}
+
+func postKey(_ pid: pid_t, _ spec: String, hid: Bool = false) -> Bool {
     // spec: "return", "cmd+t", "ctrl+a", "shift+tab"
     let parts = spec.lowercased().split(separator: "+").map(String.init)
     guard let key = parts.last else { return false }
@@ -320,20 +333,57 @@ func postKey(_ pid: pid_t, _ spec: String) -> Bool {
     let code = KEYCODES[key] ?? (key.count == 1 ? key.uppercased().unicodeScalars.first.map { UInt16($0.value) } : nil)
     guard let kc = code else { return false }
     let f = flags(mods)
-    let down = CGEvent(keyboardEventSource: nil, virtualKey: kc, keyDown: true)
-    let up = CGEvent(keyboardEventSource: nil, virtualKey: kc, keyDown: false)
+    let down = CGEvent(keyboardEventSource: ksrc(), virtualKey: kc, keyDown: true)
+    let up = CGEvent(keyboardEventSource: ksrc(), virtualKey: kc, keyDown: false)
     down?.flags = f; up?.flags = f
-    down?.postToPid(pid); usleep(15000); up?.postToPid(pid)
+    // Post each modifier as a real key press+release around the main key — some apps
+    // (Chromium) ignore synthetic events that only carry flags without modifier press.
+    let modCodes: [UInt16] = mods.map { m in
+        switch m {
+        case "cmd", "command": return UInt16(55)   // kVK_Command
+        case "ctrl", "control": return UInt16(59)  // kVK_Control
+        case "alt", "opt", "option": return UInt16(58) // kVK_Option
+        case "shift": return UInt16(56)            // kVK_Shift
+        case "fn": return UInt16(63)               // kVK_Function
+        default: return 0
+        }
+    }.filter { $0 != 0 }
+    func post(_ e: CGEvent?) {
+        if hid { e?.post(tap: .cghidEventTap) } else { e?.postToPid(pid) }
+    }
+    if hid {
+        frontWarnStore = ""
+        frontGuard(pid)
+    }
+    var modDowns: [CGEvent] = []
+    var modUps: [CGEvent] = []
+    for mc in modCodes {
+        let md = CGEvent(keyboardEventSource: ksrc(), virtualKey: mc, keyDown: true)
+        let mu = CGEvent(keyboardEventSource: ksrc(), virtualKey: mc, keyDown: false)
+        md?.flags = f; mu?.flags = f
+        modDowns.append(md!); modUps.append(mu!)
+    }
+    for e in modDowns { post(e); usleep(20000) }
+    post(down); usleep(15000); post(up); usleep(15000)
+    for e in modUps.reversed() { post(e); usleep(20000) }
+    _ = f
     return true
 }
 
-func postType(_ pid: pid_t, _ text: String) -> Bool {
-    let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true)
+func postType(_ pid: pid_t, _ text: String, hid: Bool = false) -> Bool {
+    if hid {
+        frontWarnStore = ""
+        frontGuard(pid)
+    }
+    let down = CGEvent(keyboardEventSource: ksrc(), virtualKey: 0, keyDown: true)
     down?.keyboardSetUnicodeString(stringLength: text.utf16.count, unicodeString: Array(text.utf16))
-    down?.postToPid(pid)
-    let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
+    let up = CGEvent(keyboardEventSource: ksrc(), virtualKey: 0, keyDown: false)
     up?.keyboardSetUnicodeString(stringLength: text.utf16.count, unicodeString: Array(text.utf16))
-    up?.postToPid(pid)
+    if hid {
+        down?.post(tap: .cghidEventTap); usleep(10000); up?.post(tap: .cghidEventTap)
+    } else {
+        down?.postToPid(pid); usleep(10000); up?.postToPid(pid)
+    }
     return true
 }
 
@@ -396,6 +446,23 @@ func postClick(_ pid: pid_t, _ x: CGFloat, _ y: CGFloat, hid: Bool = false) {
     fire(.mouseMoved, 40000)
     fire(.leftMouseDown, 60000)
     fire(.leftMouseUp, 120000)
+}
+
+func postRightClick(_ pid: pid_t, _ x: CGFloat, _ y: CGFloat) {
+    let src = CGEventSource(stateID: .hidSystemState)
+    func fire(_ type: CGEventType, _ delay: useconds_t) {
+        let e = CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: CGPoint(x: x, y: y), mouseButton: .right)
+        e?.post(tap: .cghidEventTap)
+        usleep(delay)
+    }
+    let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    if front != pid {
+        activateApp(pid, AXUIElementCreateApplication(pid))
+        usleep(500000)
+    }
+    fire(.mouseMoved, 40000)
+    fire(.rightMouseDown, 80000)
+    fire(.rightMouseUp, 150000)
 }
 var frontWarnStore = ""
 
@@ -464,6 +531,9 @@ func axact(args: [String: String]) {
     let focusBefore = focusedSummary(app)
     var log: [String] = []
     var confirmed = 0, unverified = 0, noop = 0, errors = 0
+    let abortOnError = (args["abort_on_error"] ?? "1") == "1"   // default ON
+    let abortOnUnverified = (args["abort_on_unverified"] ?? "") == "1"
+    var abortedAt = -1
 
     for (i, a) in actions.enumerated() {
         let op = a["op"] as? String ?? ""
@@ -475,11 +545,16 @@ func axact(args: [String: String]) {
             errors += 1
             log.append("ERR [\(i)] \(op): \(e.msg)")
         } catch { errors += 1; log.append("ERR [\(i)] \(op): \(error)") }
+        if abortOnError && (noop > 0 || errors > 0) { abortedAt = i; break }
+        if abortOnUnverified && unverified > 0 { abortedAt = i; break }
     }
 
     let winAfter = windowSnapshot()
     let focusAfter = focusedSummary(app)
     print(log.joined(separator: "\n"))
+    if abortedAt >= 0 {
+        print("ABORTED at action[\(abortedAt)] op=\(actions[abortedAt]["op"] as? String ?? "?") — remaining \(actions.count - abortedAt - 1) skipped")
+    }
     print("SUMMARY confirmed=\(confirmed) unverified=\(unverified) suspected_noop=\(noop) errors=\(errors)")
     if focusBefore != focusAfter { print("FOCUS \(focusBefore) → \(focusAfter)") } else { print("FOCUS \(focusAfter)") }
     print(winDiff(winBefore, winAfter))
@@ -590,29 +665,36 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
         return isFocused(el) ? "OK confirmed \(idx)focus \(roleOf(el))" : (r == .success ? "OK suspected_noop \(idx)focus \(roleOf(el))" : "ERR focus code=\(r.rawValue)")
     case "key":
         let spec = try reqStr(a, "key")
-        guard postKey(pid, spec) else { throw ActError(msg: "unknown key «\(spec)»") }
+        let hid = (a["hid"] as? Int) == 1
+        guard postKey(pid, spec, hid: hid) else { throw ActError(msg: "unknown key «\(spec)»") }
         usleep(200000)
-        return "OK delivered \(idx)key \(spec) focused=\(focusedSummary(app))"
+        return "OK delivered \(idx)key\(hid ? "-hid" : "") \(spec) focused=\(focusedSummary(app))\(frontWarnStore)"
     case "type":
         let text = try reqStr(a, "text")
+        let hid = (a["hid"] as? Int) == 1
+        if hid {
+            frontWarnStore = ""
+            frontGuard(pid)
+        }
         // Prefer the focused editable element's AXValue set (verifiable, instant, unicode-safe).
         if let f = attr(app, kAXFocusedUIElementAttribute), CFGetTypeID(f) == AXUIElementGetTypeID() {
             let el = f as! AXUIElement
             var settable = DarwinBoolean(false)
             AXUIElementIsAttributeSettable(el, kAXValueAttribute as CFString, &settable)
-            if settable.boolValue, let cur = strAttr(el, kAXValueAttribute) {
-                let merged = cur + text
+            if settable.boolValue {
+                let cur = strAttr(el, kAXValueAttribute) ?? ""
+                let merged = hid ? text : cur + text   // hid implies fresh focus (e.g. cmd+a / cmd+l): replace, don't append
                 let r = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, merged as CFTypeRef)
                 if r == .success {
                     usleep(120000)
                     let back = strAttr(el, kAXValueAttribute) ?? ""
-                    if back.contains(text) { return "OK confirmed \(idx)type (\(text.count) chars, via AXValue append)" }
+                    if back.contains(text) { return "OK confirmed \(idx)type (\(text.count) chars, via AXValue \(hid ? "replace" : "append"))" }
                 }
             }
         }
-        guard postType(pid, text) else { throw ActError(msg: "typing failed") }
+        guard postType(pid, text, hid: (a["hid"] as? Int) == 1) else { throw ActError(msg: "typing failed") }
         usleep(150000)
-        return "OK delivered \(idx)type (\(text.count) chars, via CGEvent)"
+        return "OK delivered \(idx)type (\(text.count) chars, via CGEvent)\(frontWarnStore)"
     case "menu":
         let path: [String]
         if let p = a["path"] as? [String] { path = p }
@@ -648,8 +730,42 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
         if (a["activate"] as? Int) != 0 { activateApp(pid, app) }
         let hid = (a["hid"] as? Int) == 1
         postClick(pid, cx, cy, hid: hid)
+        // optional inline verification: {"verify":{"path":"…:AXTextField","contains":"实施"}}
+        // or {"verify":{"text":"实施项目"}} — element value must contain `contains` (or be non-empty without it)
+        if let vf = a["verify"] as? [String: Any] {
+            var target: [String: Any] = [:]
+            for (k, v) in vf where k != "contains" { target[k] = v }
+            usleep(useconds_t(((vf["wait"] as? Int) ?? 800) * 1000))
+            let vel = try resolveTarget(target, app)
+            let v = strAttr(vel, kAXValueAttribute) ?? ""
+            let want = vf["contains"] as? String
+            if let w = want {
+                guard v.localizedCaseInsensitiveContains(w) else {
+                    throw ActError(msg: "VERIFY FAIL click\(hid ? "-hid" : "") \(what): got v=«\(esc(v, 60))» expected contains «\(w)» — abort to prevent chained wrong clicks")
+                }
+                return "OK confirmed \(idx)click\(hid ? "-hid" : "") \(what) verified v contains «\(w)»"
+            } else {
+                guard !v.isEmpty else {
+                    throw ActError(msg: "VERIFY FAIL click\(hid ? "-hid" : "") \(what): field still empty — abort")
+                }
+                return "OK confirmed \(idx)click\(hid ? "-hid" : "") \(what) verified v=«\(esc(v, 60))»"
+            }
+        }
         let focusNow = focusedSummary(app)
         return "OK unverified \(idx)click\(hid ? "-hid" : "") \(what) focused=\(focusNow)\(frontWarnStore)"
+    case "rightclick":
+        var rx: CGFloat = 0, ry: CGFloat = 0
+        if let x = a["x"] as? Int, let y = a["y"] as? Int {
+            rx = CGFloat(x); ry = CGFloat(y)
+        } else {
+            let el = try resolveTarget(a, app)
+            guard let f = axFrame(el) else { throw ActError(msg: "no frame for target") }
+            rx = f.0 + f.2 / 2; ry = f.1 + f.3 / 2
+        }
+        if (a["activate"] as? Int) != 0 { activateApp(pid, app) }
+        postRightClick(pid, rx, ry)
+        usleep(600000)
+        return "OK rightclick @(\(Int(rx)),\(Int(ry))) — context menu should be open"
     case "read":
         let el = try resolveTarget(a, app)
         let (role, label) = ident(el)
@@ -824,7 +940,7 @@ switch cmd {
 case "winlist": winlist(args["pid"].flatMap { Int32($0) })
 case "axtree": axtree(args: args)
 case "axread": axread(args: args)
-case "axact": axact(args: args)
+case "axact": axact(args: args)  // --abort_on_error 0 / --abort_on_unverified 1 pass through args
 case "shot": shot(args: args)
 case "relaunch": relaunch(args: args)
 default:
