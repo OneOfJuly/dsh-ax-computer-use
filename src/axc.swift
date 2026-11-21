@@ -7,6 +7,7 @@
 //   axread --pid N --path REF        — attributes of one element (role/title/desc/value/focused/enabled/actions)
 //   axact  --pid N --json ACTIONS    — batched verified actions; prints per-action status + summary
 //   shot   --pid N [--out F] [--max-edge N] — window screenshot via screencapture(1); prints rect line
+//   ocr    --pid N [--text S]        — Vision OCR of the window: HIT «text» center=(x,y) lines
 //   relaunch --app NAME [--args "…"] — SIGTERM quit + `open -a` with args; prints new pid
 //
 // Refs stay valid across processes: path is a child-index chain from the dumped root,
@@ -15,6 +16,7 @@
 import ApplicationServices
 import AppKit
 import Foundation
+import Vision
 
 let AX_TIMEOUT: CFTimeInterval = 3.0
 let AXAttrActions = "AXActions"
@@ -717,7 +719,15 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
     case "click":
         var cx: CGFloat = 0, cy: CGFloat = 0
         var what: String
-        if let x = a["x"] as? Int, let y = a["y"] as? Int {
+        if let kw = a["ocr"] as? String {
+            // OCR-targeted click: engine finds the text and clicks its center — no vision loop needed
+            let hits = ocrMatches(pid: pid, winIdx: a["win"] as? Int, filter: kw)
+            guard let h = hits.min(by: { $0.text.count < $1.text.count }) else {
+                throw ActError(msg: "OCR MISS «\(kw)»: no text match in window (try op ocr to list hits)")
+            }
+            cx = h.cx; cy = h.cy
+            what = "ocr «\(kw)»→«\(esc(h.text, 24))»@(\(Int(cx)),\(Int(cy)))"
+        } else if let x = a["x"] as? Int, let y = a["y"] as? Int {
             cx = CGFloat(x); cy = CGFloat(y)
             what = "@(\(x),\(y))"
         } else {
@@ -775,6 +785,12 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
         let ms = (a["ms"] as? Int) ?? 500
         usleep(useconds_t(ms * 1000))
         return "OK waited \(idx)\(ms)ms"
+    case "ocr":
+        let hits = ocrMatches(pid: pid, winIdx: a["win"] as? Int, filter: a["text"] as? String)
+        guard !hits.isEmpty else { throw ActError(msg: "no OCR text found (window hidden/minimized?)") }
+        var lines: [String] = []
+        for h in hits.prefix(25) { lines.append("«\(esc(h.text, 40))»@(\(Int(h.cx)),\(Int(h.cy)))") }
+        return "OK \(idx)ocr hits=\(min(hits.count, 25)) — " + lines.joined(separator: " ")
     case "scroll":
         guard let dy = a["dy"] as? Int else { throw ActError(msg: "need dy") }
         let dx = (a["dx"] as? Int) ?? 0
@@ -783,7 +799,7 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
         usleep(200000)
         return "OK delivered \(idx)scroll dy=\(dy) dx=\(dx)"
     default:
-        throw ActError(msg: "unknown op «\(op)» (press/set/focus/key/type/menu/select/read/wait/scroll)")
+        throw ActError(msg: "unknown op «\(op)» (press/set/focus/key/type/menu/select/read/wait/scroll/ocr/click-with-ocr)")
     }
 }
 
@@ -845,26 +861,91 @@ func winDiff(_ before: [Int: String], _ after: [Int: String]) -> String {
 
 // ── shot ──────────────────────────────────────────────────────────────────────
 
-func shot(args: [String: String]) {
-    guard let pid = Int(args["pid"] ?? "") else { print("ERR bad pid"); exit(2) }
-    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { print("ERR winlist"); exit(1) }
-    var best: (Int, Double, String) = (0, 0, "")
+func pickWindow(_ pid: Int) -> (Int, CGRect)? {
+    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return nil }
+    var best: (Int, CGRect) = (0, .zero)
     for w in list {
         let layer = w[kCGWindowLayer as String] as? Int ?? 99
         guard layer == 0, w[kCGWindowOwnerPID as String] as? Int == pid else { continue }
         guard let b = w[kCGWindowBounds as String] as? [String: Any],
               let wd = b["Width"] as? Double, let ht = b["Height"] as? Double else { continue }
-        if wd * ht > best.1 { best = (w[kCGWindowNumber as String] as? Int ?? 0, wd * ht, "x,y") }
+        if wd * ht > best.1.width * best.1.height {
+            let x = b["X"] as? Double ?? 0, y = b["Y"] as? Double ?? 0
+            best = (w[kCGWindowNumber as String] as? Int ?? 0, CGRect(x: x, y: y, width: wd, height: ht))
+        }
     }
-    guard best.0 != 0 else { print("ERR no visible window for pid \(pid)"); exit(1) }
-    let maxEdge = Int(args["max"] ?? "1280") ?? 1280
-    let tmpPng = "/tmp/axc-shot-\(pid)-\(Int(ProcessInfo.processInfo.systemUptime)).png"
+    return best.0 != 0 ? best : nil
+}
+
+func captureWindowPng(_ winId: Int, to path: String) -> Bool {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-    task.arguments = ["-o", "-x", "-l", String(best.0), tmpPng]
+    task.arguments = ["-o", "-x", "-l", String(winId), path]
     try? task.run()
     task.waitUntilExit()
-    guard task.terminationStatus == 0 else { print("ERR screencapture exit \(task.terminationStatus)"); exit(1) }
+    return task.terminationStatus == 0
+}
+
+// One OCR text hit in global screen coordinates (points).
+struct OcrHit {
+    let text: String
+    let cx: CGFloat, cy: CGFloat   // global center (points)
+    let w: CGFloat, h: CGFloat     // size (points)
+    let conf: Float
+}
+
+/// OCR a pid's window via Vision; returns hits sorted top-left → bottom-right.
+/// boundingBox is normalized with origin at bottom-left; window bounds are global points.
+func ocrMatches(pid: Int32, winIdx: Int?, filter: String?) -> [OcrHit] {
+    guard let picked = pickWindow(Int(pid)) else { return [] }
+    let (winId, bounds) = picked
+    let tmp = "/tmp/axc-ocr-\(pid)-\(Int(ProcessInfo.processInfo.systemUptime)).png"
+    guard captureWindowPng(winId, to: tmp), let img = NSImage(contentsOfFile: tmp), let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+        try? FileManager.default.removeItem(atPath: tmp)
+        return []
+    }
+    try? FileManager.default.removeItem(atPath: tmp)
+    let req = VNRecognizeTextRequest()
+    req.recognitionLevel = .accurate
+    req.usesLanguageCorrection = false
+    req.recognitionLanguages = ["zh-Hans", "en-US"]
+    let handler = VNImageRequestHandler(cgImage: cg, options: [:])
+    guard (try? handler.perform([req])) != nil else { return [] }
+    var hits: [OcrHit] = []
+    for obs in req.results ?? [] {
+        guard let cand = obs.topCandidates(1).first else { continue }
+        let box = obs.boundingBox // normalized, origin bottom-left
+        let topFrac = 1.0 - box.origin.y - box.height
+        let cx = bounds.origin.x + (box.origin.x + box.width / 2) * bounds.width
+        let cy = bounds.origin.y + (topFrac + box.height / 2) * bounds.height
+        let text = cand.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { continue }
+        if let f = filter, !text.localizedCaseInsensitiveContains(f) { continue }
+        hits.append(OcrHit(text: text,
+                           cx: cx, cy: cy,
+                           w: box.width * bounds.width, h: box.height * bounds.height,
+                           conf: cand.confidence))
+    }
+    hits.sort { $0.cy != $1.cy ? $0.cy < $1.cy : $0.cx < $1.cx }
+    return hits
+}
+
+func ocrCmd(args: [String: String]) {
+    guard let pid = Int32(args["pid"] ?? "") else { print("ERR bad pid"); exit(2) }
+    let hits = ocrMatches(pid: pid, winIdx: nil, filter: args["text"])
+    if hits.isEmpty { print("ERR no OCR text found (window hidden/minimized?)"); exit(1) }
+    for h in hits.prefix(60) {
+        print("HIT «\(h.text)» center=(\(Int(h.cx)),\(Int(h.cy))) size=(\(Int(h.w))×\(Int(h.h))) conf=\(String(format: "%.2f", h.conf))")
+    }
+    print("SUMMARY hits=\(min(hits.count, 60)) win=\(pickWindow(Int(pid))?.0 ?? 0)")
+}
+
+func shot(args: [String: String]) {
+    guard let pid = Int(args["pid"] ?? "") else { print("ERR bad pid"); exit(2) }
+    guard let (winId, bounds) = pickWindow(pid) else { print("ERR no visible window for pid \(pid)"); exit(1) }
+    let maxEdge = Int(args["max"] ?? "1280") ?? 1280
+    let tmpPng = "/tmp/axc-shot-\(pid)-\(Int(ProcessInfo.processInfo.systemUptime)).png"
+    guard captureWindowPng(winId, to: tmpPng) else { print("ERR screencapture failed"); exit(1) }
     let out = args["out"] ?? tmpPng.replacingOccurrences(of: ".png", with: ".jpg")
     let conv = Process()
     conv.executableURL = URL(fileURLWithPath: "/usr/bin/sips")
@@ -875,7 +956,7 @@ func shot(args: [String: String]) {
     guard conv.terminationStatus == 0 else { print("ERR sips exit \(conv.terminationStatus)"); exit(1) }
     let attrs = try? FileManager.default.attributesOfItem(atPath: out)
     let size = (attrs?[.size] as? Int) ?? 0
-    print("OK \(out) \(size / 1024)KB win=\(best.0) area=\(Int(best.1)) jpeg q80 max=\(maxEdge)")
+    print("OK \(out) \(size / 1024)KB win=\(winId) area=\(Int(bounds.width * bounds.height)) jpeg q80 max=\(maxEdge)")
 }
 
 // ── relaunch ──────────────────────────────────────────────────────────────────
@@ -888,7 +969,14 @@ func relaunch(args: [String: String]) {
     let running = ws.runningApplications.first { $0.localizedName == name || $0.bundleURL?.lastPathComponent == "\(name).app" }
     if let r = running {
         r.terminate()
-        for _ in 0..<32 { if r.isTerminated { break }; usleep(250000) }
+        var gone = false
+        for _ in 0..<32 { if r.isTerminated { gone = true; break }; usleep(250000) }
+        if !gone {
+            // SIGTERM ignored — force kill, else old instance lingers and args never take effect
+            kill(r.processIdentifier, SIGKILL)
+            for _ in 0..<12 { if r.isTerminated { gone = true; break }; usleep(250000) }
+            guard gone else { print("ERR \(name) pid=\(r.processIdentifier) refuses to die (SIGTERM+SIGKILL both failed) — not relaunching"); exit(1) }
+        }
     }
     usleep(500000)
     let cfg = NSWorkspace.OpenConfiguration()
@@ -942,9 +1030,10 @@ case "axtree": axtree(args: args)
 case "axread": axread(args: args)
 case "axact": axact(args: args)  // --abort_on_error 0 / --abort_on_unverified 1 pass through args
 case "shot": shot(args: args)
+case "ocr": ocrCmd(args: args)
 case "relaunch": relaunch(args: args)
 default:
     print("axc — AX-first Mac computer-use engine")
-    print("usage: axc <winlist|axtree|axread|axact|shot|relaunch> [--pid N] ...")
+    print("usage: axc <winlist|axtree|axread|axact|shot|ocr|relaunch> [--pid N] ...")
     exit(2)
 }

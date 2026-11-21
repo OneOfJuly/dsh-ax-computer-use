@@ -114,7 +114,8 @@ export function apply(ctx, _config) {
         '核心工具：**一次调用批量执行多个动作，每个动作自带验证**（读回/焦点/窗口变化 → confirmed / suspected_noop / ERR）。\n' +
         '这是比视觉循环快 10 倍的关键：把「填表单+点提交+验证」打包成一个 actions 数组。\n' +
         '定位：{"path":"1.0.0:AXCheckBox"} 或 **推荐 {"text":"提交","role":"AXButton"}**（搜文字，免疫动态页面；多处匹配用 "nth":1）。\n' +
-        '动作类型：press / set{value} / type{文本,追加} / key{"cmd+a"} / focus / menu{"格式>字体>粗体"} / read / frame / click{x,y} / wait{ms} / scroll{dy}。\n' +
+        '动作类型：press / set{value} / type{文本,追加} / key{"cmd+a"} / focus / menu{"格式>字体>粗体"} / read / frame / click{x,y 或 ocr:"文字"} / ocr{text} / wait{ms} / scroll{dy}。\n' +
+        'click 还支持 ocr 定位（自绘 UI 神器）：{"op":"click","ocr":"搜索","hid":1} = 引擎内 Vision OCR 找文字并点其中心，一轮替代截图循环；{"op":"ocr","text":"关键词"} 列出全部命中坐标。click 可加 "verify":{"path":…,"contains":…} 内联校验。\n' +
         '每次调用返回：逐动作状态行 + SUMMARY + FOCUS 前后 + WINDOWS 窗口变化。confirmed=已验证成功；suspected_noop=执行了但没观察到变化（换定位方式重试）。\n' +
         '典型流程：ax_windows → ax_tree --clickable → 一条 ax_act 批量完成 → 看 SUMMARY 决定是否需要补救动作。',
       parameters: {

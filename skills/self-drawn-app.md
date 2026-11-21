@@ -9,17 +9,27 @@ AXWindow/AXGroup nodes with no useful leaves.
 
 When AX has nothing to offer, fall through in this order:
 
-1. **ax_shot** — see the screen (JPEG ~100KB, one round-trip).
-2. **Visual coordinates** — measure targets on the screenshot, convert:
+1. **OCR targeting (v0.2.0, preferred)** — `{"op":"click","ocr":"搜索","hid":1}`
+   runs Vision OCR inside the engine, finds the text, and clicks its center.
+   One round-trip replaces the whole measure-and-click loop; Chinese and
+   English both work (`recognitionLanguages: zh-Hans, en-US`). List hits
+   first with `{"op":"ocr","text":"关键词"}` or standalone
+   `axc ocr --pid N [--text S]` (prints `HIT «text» center=(x,y)` lines).
+   The engine picks the **shortest matching text** as the click target —
+   prefer distinctive keywords over single common characters.
+2. **ax_shot** — see the screen (JPEG ~100KB, one round-trip). Only needed
+   to eyeball layout or verify a state OCR cannot express (colors, images).
+3. **Visual coordinates** — measure targets on the screenshot, convert:
    `global = windowOrigin + shotOffset × (windowSize / shotSize)`.
-3. **HID click** (`{"op":"click","x":…,"y":…,"hid":1}`) — synthetic
+4. **HID click** (`{"op":"click","x":…,"y":…,"hid":1}`) — synthetic
    postToPid events do not reach self-drawn UIs; HID-level events do.
-4. **CGEvent typing** — `{"op":"type","text":"…"}` falls back to
+5. **CGEvent typing** — `{"op":"type","text":"…"}` falls back to
    `CGEventKeyboardSetUnicodeString`, which delivers Unicode (CJK included)
    into apps with no focusable AX text element.
-5. **Screenshot verification** — with no AX values to read back, confirm
-   state changes by screenshot (the one place the vision loop is unavoidable
-   — keep it to one shot per milestone, not per keystroke).
+6. **Screenshot verification** — with no AX values to read back, confirm
+   state changes by screenshot. OCR itself is also a verifier: re-running
+   `{"op":"ocr","text":"新状态文本"}` after an action proves the UI changed
+   without spending a screenshot round.
 
 ## Worked example: sending an IM message (4 rounds, ~1 minute)
 
