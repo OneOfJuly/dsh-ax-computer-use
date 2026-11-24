@@ -89,6 +89,10 @@ swiftc -O -module-cache-path /tmp/axc-cache src/axc.swift -o bin/axc
 - [dsh-mac-computer-use](https://github.com/OrderG-X/dsh-mac-computer-use) —— 官方视觉优先插件；本项目最初就是为网页类工作流做的提速替代。
 - [dsh-operator](https://github.com/yffo/dsh-operator) —— 另一个带 CDP 浏览器自动化的社区 computer-use 套件。
 
+## 致谢
+
+- [agent-desktop](https://github.com/vercel-labs/agent-desktop)（Apache-2.0）——渲染器无障碍激活技术（设置 `AXManualAccessibility` 后轮询读回）与 STALE-REF / disposition 上报语义借鉴自其设计，已在源码中注明（见 [ARCHITECTURE.md](ARCHITECTURE.md)）。未复制任何代码，本项目为独立实现。
+
 ## 许可
 
 MIT

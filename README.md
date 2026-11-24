@@ -89,6 +89,10 @@ Xcode toolchain required (`swiftc`). The module cache path must be writable; the
 - [dsh-mac-computer-use](https://github.com/OrderG-X/dsh-mac-computer-use) — the official vision-first plugin; this project started as its faster alternative for web-heavy workflows.
 - [dsh-operator](https://github.com/yffo/dsh-operator) — another community computer-use suite with browser automation via CDP.
 
+## Credits
+
+- [agent-desktop](https://github.com/vercel-labs/agent-desktop) (Apache-2.0) — the renderer-accessibility activation technique (set `AXManualAccessibility`, then poll with readback) and the STALE-REF / disposition reporting semantics were adopted from its design and are annotated in source ([ARCHITECTURE.md](ARCHITECTURE.md)). No code was copied; this project is an independent implementation.
+
 ## License
 
 MIT
