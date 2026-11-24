@@ -1,8 +1,8 @@
 {
   "name": "dsh-ax-computer-use",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
-  "description": "AX-first Mac computer use for DSH: accessibility tree reading, batched verified actions, compact screenshots, Electron relaunch. 10x fewer round-trips than vision-only clicking.",
+  "description": "AX-first universal computer use for DSH (macOS / Windows / Linux)",
   "license": "MIT",
   "author": "guoshengqiang",
   "exports": {
@@ -15,6 +15,9 @@
     "index.js",
     "cordis.patch.yml",
     "bin",
+    "engines",
+    "skills",
+    "ARCHITECTURE.md",
     "locale",
     "icon.svg",
     "package.json"

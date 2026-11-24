@@ -180,6 +180,52 @@ func esc(_ s: String, _ n: Int) -> String {
     return String(t.prefix(n))
 }
 
+// ── v2: renderer accessibility activation with readback ───────────────────────
+// Chromium/Electron apps expose no AXWebArea until their renderer accessibility is
+// switched on. Setting AXManualAccessibility/AXEnhancedUserInterface is not enough —
+// we must poll with readback until the web content actually appears (technique
+// popularized by vercel-labs/agent-desktop, Apache-2.0). Returns true when web
+// content was detected (possibly after kicking), false when tree stays shell-only.
+
+func hasWebArea(_ el: AXUIElement, maxDepth: Int = 6, budget: Int = 300) -> Bool {
+    var visited = 0
+    func walk(_ e: AXUIElement, _ d: Int) -> Bool {
+        if d > maxDepth || visited > budget { return false }
+        visited += 1
+        if roleOf(e) == "AXWebArea" { return true }
+        guard let kids = attr(e, kAXChildrenAttribute) as? [AnyObject] else { return false }
+        for k in kids where CFGetTypeID(k) == AXUIElementGetTypeID() {
+            if walk(k as! AXUIElement, d + 1) { return true }
+        }
+        return false
+    }
+    return walk(el, 0)
+}
+
+@discardableResult
+func ensureRendererAX(_ app: AXUIElement, pid: Int32, waitMs: Int = 6000) -> Bool {
+    // quick check first — most apps already expose web content
+    let els = appWindows(app)
+    if let w = els.first, hasWebArea(w) { return true }
+
+    // kick both known switches (errors expected on non-Electron apps; ignore)
+    AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+
+    let rounds = max(1, waitMs / 600)
+    for i in 0..<rounds {
+        usleep(600_000)
+        // re-set the switch each round: some builds reset it while booting
+        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        let els2 = appWindows(app)
+        if let w = els2.first, hasWebArea(w) {
+            print("AX_ACTIVATED pid=\(pid) (rounds=\(i + 1))")
+            return true
+        }
+    }
+    return false
+}
+
 func axtree(args: [String: String]) {
     guard let pid = Int32(args["pid"] ?? "") else { print("ERR bad pid"); exit(2) }
     let depthMax = Int(args["depth"] ?? "9") ?? 9
@@ -189,6 +235,10 @@ func axtree(args: [String: String]) {
     let expandMenus = args["menu"] == "1"
 
     let app = appElement(pid)
+    // v2: shell-only tree on an Electron-ish app -> kick renderer AX before dumping
+    if args["noactivate"] != "1" {
+        _ = ensureRendererAX(app, pid: pid)
+    }
     var roots: [AXUIElement] = []
     var rootTitle = ""
     let els = appWindows(app)
@@ -289,6 +339,33 @@ func axRoot(_ app: AXUIElement, winIdx: Int) -> AXUIElement {
         return els[min(max(winIdx, 0), els.count - 1)]
     }
     return app
+}
+
+// ── v2: spatial layout cache (~/.ax-cu/cache.json) ────────────────────────────
+// Form field positions are stable across sessions but AX refs drift every snapshot.
+// remember/recall lets the model pin verified coordinates once and reuse them.
+
+let cacheURL: URL = {
+    let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ax-cu", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir.appendingPathComponent("cache.json")
+}()
+
+func loadCache() -> [String: [String: Double]] {
+    guard let d = try? Data(contentsOf: cacheURL),
+          let o = try? JSONSerialization.jsonObject(with: d) as? [String: [String: Double]] else { return [:] }
+    return o
+}
+
+func saveCache(_ c: [String: [String: Double]]) {
+    if let d = try? JSONSerialization.data(withJSONObject: c, options: [.prettyPrinted, .sortedKeys]) {
+        try? d.write(to: cacheURL)
+    }
+}
+
+func cacheKey(_ a: [String: Any], pid: Int32) -> String {
+    let appName = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid\(pid)"
+    return "\(appName):\(a["key"] as? String ?? "?")"
 }
 
 // ── keyboard delivery (CGEvent, targeted to pid) ──────────────────────────────
@@ -804,8 +881,93 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
         ev?.postToPid(pid)
         usleep(200000)
         return "OK delivered \(idx)scroll dy=\(dy) dx=\(dx)"
+
+    case "remember":
+        guard let x = a["x"] as? Int, let y = a["y"] as? Int else { throw ActError(msg: "need x,y") }
+        var c = loadCache()
+        c[cacheKey(a, pid: pid)] = ["x": Double(x), "y": Double(y)]
+        saveCache(c)
+        return "OK confirmed \(idx)remember key=\(a["key"] ?? "?") -> (\(x),\(y)) saved"
+
+    case "recall":
+        let k = cacheKey(a, pid: pid)
+        guard let p = loadCache()[k] else { throw ActError(msg: "RECALL MISS key=\(k) — remember it first") }
+        return "OK confirmed \(idx)recall \(k) -> (\(Int(p["x"] ?? 0)),\(Int(p["y"] ?? 0)))"
+
+    // v2 composite: open dropdown -> optionally HID-type a search filter -> OCR-locate the
+    // option -> HID click it -> verify the field value. The whole CEF/antd chain in one op.
+    case "dropdown":
+        // target resolution: key (cache) / ocr text / x,y — anything that yields the field coordinates
+        var fx: CGFloat = 0, fy: CGFloat = 0
+        if let kw = a["ocr"] as? String {
+            let hits = ocrMatches(pid: pid, winIdx: a["win"] as? Int, filter: kw)
+            guard let h = hits.min(by: { $0.text.count < $1.text.count }) else { throw ActError(msg: "OCR MISS «\(kw)»") }
+            fx = h.cx; fy = h.cy
+        } else if let x = a["x"] as? Int, let y = a["y"] as? Int {
+            fx = CGFloat(x); fy = CGFloat(y)
+        } else if let _ = a["key"] as? String {
+            let k = cacheKey(a, pid: pid)
+            guard let p = loadCache()[k] else { throw ActError(msg: "RECALL MISS key=\(k)") }
+            fx = CGFloat(p["x"] ?? 0); fy = CGFloat(p["y"] ?? 0)
+        } else { throw ActError(msg: "dropdown needs ocr= / x,y / key") }
+
+        if (a["activate"] as? Int) != 0 { activateApp(pid, app) }
+        postClick(pid, fx, fy, hid: true)                          // open the dropdown (HID — AXPress is a no-op on CEF)
+        usleep(useconds_t(((a["settle"] as? Int) ?? 700) * 1000))
+
+        if let search = a["search"] as? String, !search.isEmpty {  // type-to-filter combobox
+            postType(pid, search, hid: true)
+            usleep(useconds_t(((a["settle"] as? Int) ?? 900) * 1000))
+        }
+
+        let pick = try reqStr(a, "pick")                            // OCR-locate the option to click
+        let hits = ocrMatches(pid: pid, winIdx: a["win"] as? Int, filter: pick)
+        guard let h = hits.min(by: { $0.text.count < $1.text.count }) else {
+            throw ActError(msg: "OCR MISS option «\(pick)» after opening dropdown/search — list may not contain it")
+        }
+        postClick(pid, h.cx, h.cy, hid: true)
+
+        // read back: verify via given path/text or require non-empty nearest field value
+        var msg = "OK confirmed \(idx)dropdown pick «\(esc(h.text, 30))»@(\(Int(h.cx)),\(Int(h.cy)))"
+        if let vf = a["verify"] as? [String: Any] {
+            var target: [String: Any] = [:]
+            for (k, v) in vf where k != "contains" { target[k] = v }
+            usleep(useconds_t(((vf["wait"] as? Int) ?? 800) * 1000))
+            let vel = try resolveTarget(target, app)
+            let v = strAttr(vel, kAXValueAttribute) ?? ""
+            let want = vf["contains"] as? String
+            if let w = want, !v.localizedCaseInsensitiveContains(w) {
+                throw ActError(msg: "VERIFY FAIL dropdown: got v=«\(esc(v, 60))» expected contains «\(w)»")
+            }
+            msg += " verified v=«\(esc(v, 40))»"
+        }
+        return msg
+
+    // v2: scan the window tree for common form-validation error strings (antd/.NET/HTML5 style).
+    // Include after submit-type actions; findings are reported so the model knows WHY a submit failed.
+    case "read_errors":
+        let root = axRoot(app, a["win"] as? Int ?? 0)
+        var errs: [String] = []
+        let pats = ["不能", "必须", "请输入", "请选择", "错误", "超出", "失败", "invalid", "required", "error", "exceed", "must be"]
+        func scan(_ e: AXUIElement, _ d: Int) {
+            guard d < 22, errs.count < 5 else { return }
+            if roleOf(e) == "AXStaticText" || roleOf(e) == "AXAlert" {
+                let v = strAttr(e, kAXValueAttribute) ?? ""
+                if !v.isEmpty && pats.contains(where: { v.localizedCaseInsensitiveContains($0) }) {
+                    errs.append(esc(v, 60))
+                }
+            }
+            if let kids = attr(e, kAXChildrenAttribute) as? [AnyObject] {
+                for k in kids where CFGetTypeID(k) == AXUIElementGetTypeID() { scan(k as! AXUIElement, d + 1) }
+            }
+        }
+        scan(root, 0)
+        if errs.isEmpty { return "OK \(idx)read_errors none" }
+        frontWarnStore = " FORM_ERROR: \(errs.joined(separator: " | "))"
+        throw ActError(msg: "FORM_ERROR detected: \(errs.joined(separator: " | ")) — fix fields before re-submitting")
+
     default:
-        throw ActError(msg: "unknown op «\(op)» (press/set/focus/key/type/menu/select/read/wait/scroll/ocr/click-with-ocr)")
+        throw ActError(msg: "unknown op «\(op)» (press/set/focus/key/type/menu/select/read/wait/scroll/ocr/click-with-ocr/dropdown/remember/recall/read_errors)")
     }
 }
 

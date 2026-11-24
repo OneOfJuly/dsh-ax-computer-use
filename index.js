@@ -1,6 +1,7 @@
-// dsh-ax-computer-use — AX-first Mac computer use for DSH.
-// Core idea: one round-trip carries MANY verified actions (batch), verified by AX readback —
+// dsh-ax-computer-use — AX-first computer use for DSH (macOS / Windows / Linux).
+// Core idea: one round-trip carries MANY verified actions (batch), verified by a11y readback —
 // replacing the 20+ round-trip screenshot→guess→click→screenshot visual loop.
+// v2: per-platform engines behind one CLI contract (see ARCHITECTURE.md).
 import { spawn } from 'node:child_process'
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
@@ -12,10 +13,26 @@ import { fileURLToPath } from 'node:url'
 // ESM: derive the package directory from this module's URL.
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-/** Run the axc engine binary; reject on non-zero exit with combined stderr. */
+/** Pick the engine for this OS: prebuilt Swift binary (macOS), PowerShell (Windows), Python (Linux). */
+function enginePath() {
+  switch (process.platform) {
+    case 'darwin': return path.join(__dirname, 'bin', 'axc')
+    case 'win32': return path.join(__dirname, 'engines', 'axc.ps1')
+    case 'linux': return path.join(__dirname, 'engines', 'axc.py')
+    default: return path.join(__dirname, 'bin', 'axc')
+  }
+}
+
+/** Windows engines need powershell -File; *nix engines exec directly. */
+function engineCommand(engine) {
+  if (process.platform === 'win32') return ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', engine]
+  return [engine]
+}
+
+/** Run the axc engine; reject on non-zero exit with combined stderr. */
 function run(engine, args, timeoutMs = 60000) {
   return new Promise((resolve, reject) => {
-    const c = spawn(engine, args, { timeout: timeoutMs })
+    const c = spawn(engineCommand(engine)[0], [...engineCommand(engine).slice(1), ...args], { timeout: timeoutMs })
     let out = ''
     let err = ''
     c.stdout.on('data', (d) => { out += d })
@@ -56,7 +73,7 @@ const present = (title) => (args) => ({ card: 'generic', title, kind: 'other', r
 export const inject = ['tools']
 
 export function apply(ctx, _config) {
-  const engine = path.join(__dirname, 'bin', 'axc')
+  const engine = enginePath()
   try { fs.chmodSync(engine, 0o755) } catch { /* already executable */ }
 
   const tools = [
@@ -115,6 +132,7 @@ export function apply(ctx, _config) {
         '这是比视觉循环快 10 倍的关键：把「填表单+点提交+验证」打包成一个 actions 数组。\n' +
         '定位：{"path":"1.0.0:AXCheckBox"} 或 **推荐 {"text":"提交","role":"AXButton"}**（搜文字，免疫动态页面；多处匹配用 "nth":1）。\n' +
         '动作类型：press / set{value} / type{文本,追加} / key{"cmd+a"} / focus / menu{"格式>字体>粗体"} / read / frame / click{x,y 或 ocr:"文字"} / ocr{text} / wait{ms} / scroll{dy}。\n' +
+        'v2 组合 op：{"op":"dropdown","x":..,"y":..,"search":"示例","pick":"ALPHA","verify":{"text":"项目","contains":"ALPHA"}} = 开下拉→HID 输入过滤→OCR 点选→读回验证（CEF/antd 表单神器）；{"op":"remember","key":"类别","x":..,"y":..} / recall = 空间坐标缓存（表单字段位置跨会话稳定，缓存后直接点）；{"op":"read_errors"} = 扫描表单校验错误（提交后必加，报 FORM_ERROR）。\n' +
         'click 还支持 ocr 定位（自绘 UI 神器）：{"op":"click","ocr":"搜索","hid":1} = 引擎内 Vision OCR 找文字并点其中心，一轮替代截图循环；{"op":"ocr","text":"关键词"} 列出全部命中坐标。click 可加 "verify":{"path":…,"contains":…} 内联校验。\n' +
         '每次调用返回：逐动作状态行 + SUMMARY + FOCUS 前后 + WINDOWS 窗口变化。confirmed=已验证成功；suspected_noop=执行了但没观察到变化（换定位方式重试）。\n' +
         '典型流程：ax_windows → ax_tree --clickable → 一条 ax_act 批量完成 → 看 SUMMARY 决定是否需要补救动作。',
