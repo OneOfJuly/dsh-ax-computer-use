@@ -2,7 +2,7 @@
 
 [English](README.md) | [中文](README.zh.md)
 
-**面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（macOS）的通用 AX-first 电脑操作插件** —— 让智能体直接读 macOS 无障碍树来"看"屏幕，以**批量、机器验证**的方式执行动作，只在真正需要像素时才退回截图。覆盖**所有类型的 Mac 应用**，不限于某一类：
+**面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的通用 AX-first 电脑操作插件（macOS / Windows / Linux 三平台）** —— 让智能体直接读系统无障碍树（macOS AX / Windows UIA / Linux AT-SPI2）来"看"屏幕，以**批量、机器验证**的方式执行动作，只在真正需要像素时才退回截图。覆盖**所有类型的桌面应用**，不限于某一类：
 
 | 应用类型 | 例子 | 有效通道 | 实测 |
 |---|---|---|---|
@@ -52,7 +52,7 @@
 
 ## 原生、网页、Electron —— 一套工具全覆盖
 
-- **原生 macOS 应用**：完整 AX 读写；实测 `AXSetValue` 写入 8 ms 内带读回确认。菜单、工具栏勾选框、文字插入全部验证通过。
+- **原生应用（三平台）**：完整无障碍树读写——macOS 用 AX、Windows 用 UI Automation、Linux 用 AT-SPI2。实测 `AXSetValue` 类写入 8 ms 内带读回确认。菜单、工具栏勾选框、文字插入全部验证通过。
 - **Chrome / Chromium 浏览器**：渲染器 AX 树原生暴露，网页内容按文本读。AX 派发不了的动作降级走 **HID 级硬件事件**——多窗口多显示器下实测点开 bilibili 选集面板。
 - **隐藏 AX 树的 Electron / CEF 应用**（Lark 及大量 Electron 架构应用）：`ax_relaunch --app Lark --args "--force-renderer-accessibility"` 带参数重启——**登录不掉**——整张网页界面变得可读可操作。这是纯视觉工具完全做不到的场景。
 
@@ -66,13 +66,17 @@ dsh plugin add github:OneOfJuly/dsh-ax-computer-use
 
 环境要求：
 
-- macOS + Apple Silicon（预编译 `bin/axc`，arm64）。Intel Mac 请用 `swiftc -O` 从 `src/axc.swift` 自行编译替换。
+- macOS：Apple Silicon 预编译 `bin/axc`（arm64）；Intel Mac 用 `swiftc -O` 从 `src/axc.swift` 自行编译替换
+- Windows：系统自带 PowerShell 5.1+ 即可，无需安装——`engines/axc.ps1`（UIA + SendInput + WinRT OCR）
+- Linux（X11）：需 `python3-pyatspi`、`python3-xlib`、`xdotool`、`wmctrl`、`tesseract-ocr tesseract-ocr-chi-sim`、`scrot`——`engines/axc.py`（AT-SPI2 + XTest）
 - DSH ≥ 0.2.1（实测 0.2.2-rc.5）。
-- macOS 权限：给 DSH 宿主应用授予**辅助功能** + **屏幕录制**（系统设置 → 隐私与安全性）。插件引擎作为子进程继承权限——无需逐工具授权。
+- macOS：给 DSH 宿主应用授予**辅助功能** + **屏幕录制**（系统设置 → 隐私与安全性），引擎作为子进程继承权限
+- Windows：无需特殊配置（UIA 不受限；OCR 需系统语言包）
+- Linux：开启无障碍支持（GNOME：设置 → 辅助功能，或 `gsettings set org.gnome.desktop.interface toolkit-accessibility true`）
 
 ## 架构
 
-一个无状态 Swift 二进制（`bin/axc`，约 170 KB，无守护进程、无依赖）承担全部 macOS 侧工作；`index.js` 是六个 DSH 工具的薄映射。每次工具调用启动一个短命进程：列窗口、倒树、跑动作批、截图、重启应用。没有持久状态，没有可崩的东西，没有需要清理的东西。
+每个操作系统一个无状态引擎（macOS：Swift 二进制 `bin/axc`；Windows：PowerShell `engines/axc.ps1`；Linux：Python `engines/axc.py`——同一 CLI 契约，详见 [ARCHITECTURE.md](ARCHITECTURE.md)）；`index.js` 是六个 DSH 工具的薄映射。每次工具调用启动一个短命进程：列窗口、倒树、跑动作批、截图、重启应用。没有持久状态，没有可崩的东西，没有需要清理的东西。
 
 安全姿态：HID 点击会动真实鼠标，受前台应用守卫保护；键盘事件按进程投递（不抢全局焦点）；二进制**不联网、不留日志**；截图只经 DSH 自身附件管线流转。
 

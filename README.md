@@ -2,7 +2,7 @@
 
 [English](README.md) | [中文](README.zh.md)
 
-**Universal computer use for macOS, AX-first** — for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). The agent reads the macOS Accessibility tree instead of staring at screenshots, acts in **batched, machine-verified steps**, and only falls back to vision when pixels are genuinely needed. Works across **every category of Mac app**, not just one:
+**Universal computer use for macOS / Windows / Linux, AX-first** — for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). The agent reads the platform accessibility tree (AX / UIA / AT-SPI2) instead of staring at screenshots, acts in **batched, machine-verified steps**, and only falls back to vision when pixels are genuinely needed. Works across **every category of desktop app**, not just one:
 
 | App category | Example | Channel that works | Verified in the wild |
 |---|---|---|---|
@@ -52,7 +52,7 @@ Measured on real tasks: a form-filling workflow in a CEF-based enterprise web ap
 
 ## Native, web, and Electron — one toolset
 
-- **Native macOS apps**: full AX read/write; `AXSetValue` writes land in ~8 ms with read-back confirmation. Menus, toolbar checkboxes, text insertion all verified.
+- **Native apps** (all 3 OS): full a11y-tree read/write — AX on macOS, UI Automation on Windows, AT-SPI2 on Linux. `AXSetValue`-style writes land in ~8 ms with read-back confirmation. Menus, toolbar checkboxes, text insertion all verified.
 - **Chrome / Chromium browsers**: the renderer AX tree is exposed, so web content is readable as text. Clicks that AX cannot dispatch fall through to **HID-grade hardware events** — verified opening bilibili's episode panel on a multi-window, multi-display setup.
 - **Electron / CEF apps that hide their AX tree** (Lark, and many other Electron-based apps): `ax_relaunch --app Lark --args "--force-renderer-accessibility"` relaunches with the renderer accessibility flag — **login preserved** — and the whole web UI becomes readable and scriptable. This is the case vision-only tools simply cannot do at all.
 
@@ -66,13 +66,19 @@ or from the plugin market (after the catalog entry lands): search **dsh-ax-compu
 
 Requirements:
 
-- macOS on Apple Silicon (prebuilt `bin/axc`, arm64). Intel Macs: build from `src/axc.swift` with `swiftc -O` and replace the binary.
+- macOS (Apple Silicon prebuilt `bin/axc`, arm64; Intel: build from `src/axc.swift` with `swiftc -O`)
+- Windows (PowerShell 5.1+ built-in; no install needed — `engines/axc.ps1`, UIA + SendInput + WinRT OCR)
+- Linux (X11; needs `python3-pyatspi`, `python3-xlib`, `xdotool`, `wmctrl`, `tesseract-ocr tesseract-ocr-chi-sim`, `scrot` — `engines/axc.py`, AT-SPI2 + XTest)
 - DSH ≥ 0.2.1 (tested on 0.2.2-rc.5).
-- macOS permissions: **Accessibility** + **Screen Recording** granted to the DSH host app (System Settings → Privacy & Security). The plugin engine runs as a child process and inherits them — no per-tool prompts.
+- macOS: grant **Accessibility** + **Screen Recording** to the DSH host app (System Settings → Privacy & Security); the engine runs as a child process and inherits them.
+- Windows: no special setup (UIA is unrestricted; OCR needs a Windows language pack).
+- Linux: enable accessibility (GNOME: Settings → Accessibility, or `gsettings set org.gnome.desktop.interface toolkit-accessibility true`).
+
+> **Platform maturity**: macOS = fully validated in production use. Windows/Linux engines implement the full contract (see [ARCHITECTURE.md](ARCHITECTURE.md)) but are awaiting first on-device validation — bug reports welcome.
 
 ## Architecture
 
-One stateless Swift binary (`bin/axc`, ~170 KB, no daemon, no dependencies) does all macOS work; `index.js` is a thin mapping to six DSH tools. Each tool call spawns one short-lived process: list windows, dump a tree, run an action batch, take a shot, or relaunch an app. No persistent state, nothing to crash, nothing to clean up.
+One stateless engine per OS (`bin/axc` Swift binary on macOS, `engines/axc.ps1` PowerShell on Windows, `engines/axc.py` Python on Linux — all behind the same CLI contract, see [ARCHITECTURE.md](ARCHITECTURE.md)); `index.js` is a thin mapping to six DSH tools. Each tool call spawns one short-lived process: list windows, dump a tree, run an action batch, take a shot, or relaunch an app. No persistent state, nothing to crash, nothing to clean up.
 
 Safety posture: HID clicks move the real cursor and are guarded by the frontmost-app check; keyboard events are posted per-process (no global focus stealing); the binary makes **no network calls** and keeps **no logs**; screenshots live only in DSH's own attachment pipeline.
 
