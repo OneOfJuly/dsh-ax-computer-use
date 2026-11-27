@@ -1,5 +1,9 @@
 # dsh-ax-computer-use
 
+
+![ax-computer-use 演示：一条批量指令完成网页表单填报（读取树 → 下拉选择 → 输入并校验 → 提交）](assets/demo.gif)
+
+
 [English](README.md) | [中文](README.zh.md)
 
 **Universal computer use for macOS / Windows / Linux, AX-first** — for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). The agent reads the platform accessibility tree (AX / UIA / AT-SPI2) instead of staring at screenshots, acts in **batched, machine-verified steps**, and only falls back to vision when pixels are genuinely needed. Works across **every category of desktop app**, not just one:

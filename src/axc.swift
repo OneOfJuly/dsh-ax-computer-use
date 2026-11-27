@@ -105,7 +105,9 @@ func findInTree(_ root: AXUIElement, _ text: String, _ role: String?, _ nth: Int
     var hits = 0
     var visited = 0
     func label(_ el: AXUIElement) -> String {
-        return (strAttr(el, kAXTitleAttribute) ?? "") + " \u{1}" + (strAttr(el, kAXValueAttribute) ?? "") + " \u{1}" + (strAttr(el, kAXDescriptionAttribute) ?? "")
+        var s = (strAttr(el, kAXTitleAttribute) ?? "") + " \u{1}" + (strAttr(el, kAXValueAttribute) ?? "") + " \u{1}" + (strAttr(el, kAXDescriptionAttribute) ?? "")
+        if let ph = strAttr(el, "AXPlaceholderValue"), !ph.isEmpty { s += " \u{1}" + ph }  // placeholder 也是常用定位锚点
+        return s
     }
     func walk(_ el: AXUIElement, _ depth: Int) -> Bool {
         if visited > 4000 || depth > 30 { return false }
@@ -1021,12 +1023,105 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
         usleep(250000)
         return r == "OK" ? "OK confirmed \(idx)menu \(path.joined(separator: ">"))" : "\(r) [\(idx)menu \(path.joined(separator: ">"))]"
     case "select":
+        // 下拉选择：press 打开 → 轮询 AXMenu → 按标题匹配 AXMenuItem → press → 读回 value 验证
         let el = try resolveTarget(a, app)
-        let r = AXUIElementSetAttributeValue(el, kAXSelectedAttribute as CFString, kCFBooleanTrue)
-        usleep(100000)
-        let sel = attr(el, kAXSelectedAttribute)
-        let selStr = sel.map { "\($0)" } ?? "?"
-        return r == .success ? "OK \(selStr == "1" || selStr == "kCFBooleanTrue" ? "confirmed" : "suspected_noop") \(idx)select \(roleOf(el))" : "ERR select code=\(r.rawValue)"
+        let want = a["value"] as? String ?? ""
+        guard !want.isEmpty else { throw ActError(msg: "select needs value") }
+        let before = (attr(el, kAXValueAttribute) as? String) ?? ""
+        if before == want { return "OK confirmed \(idx)select already «\(esc(want, 24))» (idempotent skip)" }
+        let pr = AXUIElementPerformAction(el, kAXPressAction as CFString)
+        guard pr == .success else { throw ActError(msg: "select press failed code=\(pr.rawValue)") }
+        // 轮询菜单出现（app 子节点 AXMenu 或元素 AXMenu 属性）
+        var menuItem: AXUIElement?
+        for _ in 0..<14 {
+            usleep(150_000)
+            if let m = attr(el, AXAttrMenu), CFGetTypeID(m) == AXUIElementGetTypeID() {
+                let me = m as! AXUIElement
+                if let items = attr(me, kAXChildrenAttribute) as? [AnyObject], let first = items.first,
+                   CFGetTypeID(first) == AXUIElementGetTypeID(), roleOf(first as! AXUIElement) == "AXMenuItem" { menuItem = me; break }
+            }
+            // Chrome 的 select 菜单挂在焦点链上：focused 元素向上走 ≤4 层找 AXMenu
+            if let f = attr(app, kAXFocusedUIElementAttribute), CFGetTypeID(f) == AXUIElementGetTypeID() {
+                var cur = f as! AXUIElement
+                for _ in 0..<4 {
+                    if roleOf(cur) == "AXMenu" { menuItem = cur; break }
+                    guard let p = attr(cur, kAXParentAttribute), CFGetTypeID(p) == AXUIElementGetTypeID() else { break }
+                    cur = p as! AXUIElement
+                }
+                if menuItem != nil { break }
+            }
+            if let kids = attr(app, kAXChildrenAttribute) as? [AnyObject] {
+                for k in kids where CFGetTypeID(k) == AXUIElementGetTypeID() {
+                    let ke = k as! AXUIElement
+                    if roleOf(ke) == "AXMenu" {
+                        if let items = attr(ke, kAXChildrenAttribute) as? [AnyObject], let first = items.first,
+                           CFGetTypeID(first) == AXUIElementGetTypeID(), roleOf(first as! AXUIElement) == "AXMenuItem" { menuItem = ke; break }
+                    }
+                }
+                if menuItem != nil { break }
+            }
+        }
+        guard let menu = menuItem else {
+            _ = AXUIElementPerformAction(el, "AXCancel" as CFString)
+            postKey(pid, "escape")
+            throw ActError(msg: "select menu did not open (select may not be a real dropdown)")
+        }
+        // 匹配菜单项：精确 → 前缀 → 包含
+        // 收集菜单项：menu children 优先；Chrome 有时 children 为空 → 从焦点 item 沿兄弟链收集
+        var itemEls: [AXUIElement] = []
+        if let items = attr(menu, kAXChildrenAttribute) as? [AnyObject] {
+            for i in items where CFGetTypeID(i) == AXUIElementGetTypeID() {
+                let e = i as! AXUIElement
+                if roleOf(e) == "AXMenuItem" { itemEls.append(e) }
+            }
+        }
+        if itemEls.isEmpty, let f = attr(app, kAXFocusedUIElementAttribute), CFGetTypeID(f) == AXUIElementGetTypeID(), roleOf(f as! AXUIElement) == "AXMenuItem" {
+            var cur = f as! AXUIElement
+            var guardN = 0
+            while guardN < 64 {
+                itemEls.append(cur); guardN += 1
+                guard let nx = attr(cur, "AXNextSibling"), CFGetTypeID(nx) == AXUIElementGetTypeID(), roleOf(nx as! AXUIElement) == "AXMenuItem" else { break }
+                cur = nx as! AXUIElement
+            }
+            // 也往回走补齐前面的项
+            var first = itemEls.first!
+            while guardN < 128, let pv = attr(first, "AXPreviousSibling"), CFGetTypeID(pv) == AXUIElementGetTypeID(), roleOf(pv as! AXUIElement) == "AXMenuItem" {
+                first = pv as! AXUIElement
+                itemEls.insert(first, at: 0); guardN += 1
+            }
+        }
+        let items: [AnyObject] = itemEls.map { $0 }
+        guard !items.isEmpty else { throw ActError(msg: "select menu empty") }
+        func title(_ e: AXUIElement) -> String { (attr(e, kAXTitleAttribute) as? String) ?? (attr(e, kAXValueAttribute) as? String) ?? "" }
+        var target: AXUIElement?
+        for i in items where CFGetTypeID(i) == AXUIElementGetTypeID() {
+            let ie = i as! AXUIElement
+            if roleOf(ie) != "AXMenuItem" { continue }
+            let t = title(ie)
+            if t == want { target = ie; break }
+        }
+        if target == nil { for i in items where CFGetTypeID(i) == AXUIElementGetTypeID() { let ie = i as! AXUIElement; let t = title(ie); if t.hasPrefix(want) { target = ie; break } } }
+        if target == nil { for i in items where CFGetTypeID(i) == AXUIElementGetTypeID() { let ie = i as! AXUIElement; let t = title(ie); if t.contains(want) { target = ie; break } } }
+        guard let hit = target else {
+            postKey(pid, "escape")
+            let listed = items.compactMap { i -> String? in
+                guard CFGetTypeID(i) == AXUIElementGetTypeID() else { return nil }
+                let e = i as! AXUIElement
+                guard roleOf(e) == "AXMenuItem" else { return nil }
+                let t = title(e); return t.isEmpty ? nil : t
+            }.prefix(8).joined(separator: "/")
+            throw ActError(msg: "menu has no «\(want)» — options: \(listed)")
+        }
+        let pir = AXUIElementPerformAction(hit, kAXPressAction as CFString)
+        usleep(200_000)
+        let after = (attr(el, kAXValueAttribute) as? String) ?? ""
+        if pir == .success && (after == want || after.contains(want)) {
+            return "OK confirmed \(idx)select «\(esc(after, 24))» (menu pick verified)"
+        }
+        // 部分网页 select 不回读 value：菜单项本身命中即算 unverified
+        return pir == .success
+            ? "OK unverified \(idx)select menu item «\(esc(title(hit), 24))» pressed (select value not readable)"
+            : "ERR menu item press code=\(pir.rawValue)"
     case "frame":
         let el = try resolveTarget(a, app)
         let (role, label) = ident(el)
@@ -1224,7 +1319,8 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
 }
 
 func reqStr(_ a: [String: Any], _ k: String) throws -> String {
-    guard let v = a[k] as? String, !v.isEmpty else { throw ActError(msg: "missing «\(k)»") }
+    guard let v0 = a[k] as? String else { throw ActError(msg: "missing «\(k)»") }
+    let v = v0  // 允许显式空串（清空字段是合法操作）
     return v
 }
 

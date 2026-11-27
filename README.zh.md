@@ -1,5 +1,9 @@
 # dsh-ax-computer-use
 
+
+![ax-computer-use 演示：一条批量指令完成网页表单填报（读取树 → 下拉选择 → 输入并校验 → 提交）](assets/demo.gif)
+
+
 [English](README.md) | [中文](README.zh.md)
 
 **面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的通用 AX-first 电脑操作插件（macOS / Windows / Linux 三平台）** —— 让智能体直接读系统无障碍树（macOS AX / Windows UIA / Linux AT-SPI2）来"看"屏幕，以**批量、机器验证**的方式执行动作，只在真正需要像素时才退回截图。覆盖**所有类型的桌面应用**，不限于某一类：
