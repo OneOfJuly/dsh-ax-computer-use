@@ -1,6 +1,6 @@
 {
   "name": "dsh-ax-computer-use",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "type": "module",
   "description": "AX-first universal computer use for DSH (macOS / Windows / Linux)",
   "license": "MIT",

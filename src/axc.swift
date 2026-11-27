@@ -334,6 +334,10 @@ func axtree(args: [String: String]) {
         _ = ensureRendererAX(app, pid: pid, waitMs: Int(args["warm"] ?? "-1") ?? -1)
     }
     let els = appWindows(app)
+    if els.isEmpty {
+        // AX 假死的两种表现：AXWindows 报错 / 返回 app 自引用伪窗（已过滤）。给 agent 诚实的出路
+        print("HINT app AX tree is napping (AXWindows unavailable or self-referential) — activate the app (open -a / click) and retry; if it persists, quit+relaunch the app")
+    }
     // Chromium 的惰性树：含网页内容的窗口先空跑几轮 children，等节点数不再增长再正式 dump，否则侧栏/弹窗会时有时无
     if args["noactivate"] != "1" {
         for w in els where hasWebArea(w) { warmAX(w) }
@@ -387,6 +391,7 @@ func axtree(args: [String: String]) {
         count += 1
         if truncated() { return }
         let (role, label) = ident(el)
+        if depth > 0 && role == "AXApplication" { return }  // 自引用防护
         if !expandMenus && (role == "AXMenuBar" || role == "AXMenu") {
             rows.append((chain, "\(indent(depth))[\(refOf(chain, role))] \(role) …menus pruned (pass menu=1 to expand)"))
             return
@@ -864,6 +869,11 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
         // Fallback 1: checkbox/radio toggle via value set (many expose empty AXActions but settable value)
         if act == nil && (role == "AXCheckBox" || role == "AXRadioButton") {
             let isOn: Bool = (stateBefore == "1" || stateBefore == "true" || stateBefore.lowercased() == "yes")
+            // 幂等 Toggle（AD 同款）：请求值与当前一致 → 直接 confirmed，不再翻转
+            if let want = a["value"] as? Int {
+                let wantOn = want != 0
+                if wantOn == isOn { return "OK confirmed \(idx)press \(role) «\(esc(label, 30))» already \(isOn ? "on" : "off") (idempotent skip)" }
+            }
             let n = NSNumber(value: isOn ? 0 : 1)
             let r = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, n)
             usleep(150000)
@@ -943,7 +953,7 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
             usleep(120000)
             let back2 = strAttr(el, kAXValueAttribute) ?? ""
             if back2 == value || back == value { return "OK confirmed \(idx)set \(role) «\(esc(label, 30))» = \(esc(value, 40))" }
-            return "OK suspected_noop \(idx)set \(role) — readback «\(esc(back2, 40))» ≠ input"
+            throw ActError(msg: "VERIFY FAIL \(idx)set \(role) «\(esc(label, 30))» — expected «\(esc(value, 40))» got «\(esc(back2, 40))» (app may reject/transform the value; read the field, then set the full intended value)")
         } else {
             // fallback: focus + synthesized typing
             AXUIElementPerformAction(el, kAXRaiseAction as CFString)
@@ -985,9 +995,18 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
                 let merged = hid ? text : cur + text   // hid implies fresh focus (e.g. cmd+a / cmd+l): replace, don't append
                 let r = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, merged as CFTypeRef)
                 if r == .success {
-                    usleep(120000)
-                    let back = strAttr(el, kAXValueAttribute) ?? ""
-                    if back.contains(text) { return "OK confirmed \(idx)type (\(text.count) chars, via AXValue \(hid ? "replace" : "append"))" }
+                    // settle poll: key events reach the field through the app queue —
+                    // poll until the value stops changing or the expected tail appears (AD 同款)
+                    var back = strAttr(el, kAXValueAttribute) ?? ""
+                    for _ in 0..<6 {
+                        if back.hasSuffix(text) { break }
+                        usleep(80_000)
+                        let next = strAttr(el, kAXValueAttribute) ?? ""
+                        if next == back { break }  // stable but not matching → report honestly below
+                        back = next
+                    }
+                    if back.hasSuffix(text) || back.contains(text) { return "OK confirmed \(idx)type (\(text.count) chars, via AXValue \(hid ? "replace" : "append"))" }
+                    throw ActError(msg: "VERIFY FAIL \(idx)type — field tail «\(esc(String(back.suffix(40)), 40))» does not end with «\(esc(text, 40))» (field may sanitize or reroute input; use set instead)")
                 }
             }
         }
@@ -1217,7 +1236,9 @@ func appWindows(_ app: AXUIElement) -> [AXUIElement] {
     func read() -> [AXUIElement]? {
         guard let wins = attr(app, kAXWindowsAttribute) as? [AnyObject] else { return nil }
         let els = wins.filter { CFGetTypeID($0) == AXUIElementGetTypeID() }.map { $0 as! AXUIElement }
-        return els.isEmpty ? nil : els
+        // 修复（b52 遗留）：AX 假死时 AXWindows 会把 app 元素自己当「窗口」返回 → 无限嵌套 AXApplication 树
+        let real = els.filter { roleOf($0) != "AXApplication" }
+        return real.isEmpty ? nil : real
     }
     if let els = read() { return els }
     var pid: pid_t = 0
