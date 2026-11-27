@@ -239,23 +239,76 @@ func kickRendererAX(_ app: AXUIElement) {
     AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
 }
 
-@discardableResult
-func ensureRendererAX(_ app: AXUIElement, pid: Int32, waitMs: Int = 6000) -> Bool {
-    kickRendererAX(app)
-    // quick check first — most apps already expose web content
-    let els = appWindows(app)
-    if let w = els.first, hasWebArea(w) { return true }
+/// Chromium 家族判定：bundle id / 可执行路径 / 进程名任一命中即视为渲染器 AX 需要长等待的家族。
+func isChromiumFamily(_ pid: Int32) -> Bool {
+    guard let napp = NSRunningApplication(processIdentifier: pid) else { return false }
+    let hay = [napp.bundleIdentifier ?? "", napp.localizedName ?? "",
+               napp.executableURL?.path ?? ""].joined(separator: "\n").lowercased()
+    let needles = ["google chrome", "chromium", "microsoft edge", "brave", "arc", "lark",
+                   "feishu", "electron", "visual studio code", "vscode", "slack", "discord",
+                   "notion", "obsidian", "dingtalk", "wecom", "huya", "douyin"]
+    return needles.contains { hay.contains($0) }
+}
 
-    let rounds = max(1, waitMs / 600)
-    for i in 0..<rounds {
-        usleep(600_000)
-        // re-set the switch each round: some builds reset it while booting
+var axActivatedPids = Set<Int32>()
+
+/// 读单个属性是否可写（判定 Electron ENHANCED 静置用）。
+func attrSettable(_ el: AXUIElement, _ name: String) -> Bool {
+    var settable: DarwinBoolean = false
+    let err = AXUIElementIsAttributeSettable(el, name as CFString, &settable)
+    return err == .success && settable.boolValue
+}
+
+/// v3 renderer activation: kick attrs + poll with readback.
+/// - Chromium 家族冷启动 10-25s 才暴露 web 树（agent-desktop 文档同款结论）；
+/// - Chrome 浏览器拒设 Manual/Enhanced（-25205），唤醒靠 AX 查询流量本身（children-only 轻扫）+ 持续回读；
+/// - Electron：ENHANCED 置位后需 ~2s 静置；
+/// - waitMs=-1 走 auto（家族 20s / 其他 2s）；同 pid 激活过后走快速通道（树睡了自动降级全流程）。
+@discardableResult
+func ensureRendererAX(_ app: AXUIElement, pid: Int32, waitMs: Int = -1) -> Bool {
+    // 内容窗探测 + 苏醒检测：壳辅助窗 children 0~1 个，主窗几十起；
+    // Chromium 的 web 树「有查询流量就醒、闲置自动睡」，所以轮询流量必须打在主窗上
+    func awakeNow() -> Bool {
+        let els = appWindows(app)
+        guard !els.isEmpty else { return false }
+        var main: AXUIElement?
+        var best = 0
+        for w in els {
+            AXUIElementSetMessagingTimeout(w, Float(AX_TIMEOUT))
+            let n = (attr(w, kAXChildrenAttribute) as? [AnyObject])?.count ?? 0
+            if n > best { best = n; main = w }
+        }
+        guard let mw = main, best > 0 else { return false }
+        return hasWebArea(mw, maxDepth: 8, budget: 800)
+    }
+
+    if axActivatedPids.contains(pid) {
         kickRendererAX(app)
-        let els2 = appWindows(app)
-        if let w = els2.first, hasWebArea(w) {
+        if awakeNow() { return true }
+        axActivatedPids.remove(pid)  // 树睡了（Chromium 闲置自动关无障碍），走全流程重新唤醒
+    }
+    kickRendererAX(app)
+    if awakeNow() { axActivatedPids.insert(pid); return true }
+
+    let chromium = isChromiumFamily(pid)
+    let total = waitMs >= 0 ? waitMs : (chromium ? 4_000 : 600)  // 原生 App 无渲染器可唤醒，单次复查即可
+    var settledElectron = false
+    let rounds = max(1, total / 500)
+    for i in 0..<rounds {
+        usleep(500_000)
+        kickRendererAX(app)
+        if !settledElectron, attrSettable(app, "AXEnhancedUserInterface") {
+            settledElectron = true
+            usleep(1_400_000)  // Electron ENHANCED 静置
+        }
+        if awakeNow() {  // 读取本身即唤醒流量
+            axActivatedPids.insert(pid)
             print("AX_ACTIVATED pid=\(pid) (rounds=\(i + 1))")
             return true
         }
+    }
+    if chromium {
+        print("HINT web tree not visible after \(total)ms — Chromium toggles renderer accessibility with user activity; polling cannot force it awake. For a guaranteed tree, relaunch with --force-renderer-accessibility via ax_relaunch")
     }
     return false
 }
@@ -275,9 +328,10 @@ func axtree(args: [String: String]) {
     let walkCap = searchMode ? max(nodeCap, 6000) : nodeCap
 
     let app = appElement(pid)
-    // v2: shell-only tree on an Electron-ish app -> kick renderer AX before dumping
+    // v3: shell-only tree on an Electron-ish app -> kick renderer AX before dumping.
+    // --warm N 覆盖等待毫秒（默认 auto：Chromium 家族 20s / 其他 2s）
     if args["noactivate"] != "1" {
-        _ = ensureRendererAX(app, pid: pid)
+        _ = ensureRendererAX(app, pid: pid, waitMs: Int(args["warm"] ?? "-1") ?? -1)
     }
     let els = appWindows(app)
     // Chromium 的惰性树：含网页内容的窗口先空跑几轮 children，等节点数不再增长再正式 dump，否则侧栏/弹窗会时有时无
@@ -286,8 +340,26 @@ func axtree(args: [String: String]) {
     }
     let explicitWin = Int(args["win"] ?? "")
     var candidates: [(AXUIElement, String)] = []
-    if let wi = explicitWin, wi < els.count { candidates = [(els[wi], strAttr(els[wi], kAXTitleAttribute) ?? "")] }
-    else if !els.isEmpty { candidates = [(els[0], strAttr(els[0], kAXTitleAttribute) ?? "")] }
+    if let wi = explicitWin, wi < els.count {
+        candidates = [(els[wi], strAttr(els[wi], kAXTitleAttribute) ?? "")]
+    } else if !els.isEmpty {
+        // v3 关键修复：Chrome/Electron 把空壳辅助窗排在 window 0，默认必须选内容窗——
+        // 优先第一个含 AXWebArea 的；全没有则取子元素最多的；输出 pick 行让 agent 可见
+        var pick = 0
+        for (i, w) in els.enumerated() where hasWebArea(w) { pick = i; break }
+        if pick == 0 {
+            var bestCount = -1
+            for (i, w) in els.enumerated() {
+                let n = (attr(w, kAXChildrenAttribute) as? [AnyObject])?.count ?? 0
+                if n > bestCount { bestCount = n; pick = i }
+            }
+        }
+        let t = strAttr(els[pick], kAXTitleAttribute) ?? ""
+        candidates = [(els[pick], t)]
+        if els.count > 1 || pick != 0 {
+            print("WINDOW pick=\(pick) «\(t)» (\(els.count) windows; pass win=N to choose another)")
+        }
+    }
     // Cross-window text search: with a text filter and no explicit win, scan every window
     // and report the first one that yields hits (Chrome's AX window 0 is often an empty helper window).
     if searchMode, explicitWin == nil, els.count > 1 {
