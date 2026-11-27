@@ -66,6 +66,12 @@
 - ❌ CDP 端口：`--remote-debugging-port` 参数被 Lark 启动器洗掉（9222/9229/9333 均未开）。
 - ❌ postToPid 鼠标：焦点移动但 JS 不触发。
 
+### 2026-11-27 飞书 Lark 复测（pid 7519，未重启、未加 --force-renderer-accessibility）
+- ✅ 读树前设置 AXManualAccessibility + AXEnhancedUserInterface（kick）并预热 children，网页内容直接可读；原生侧栏 AXRadioButton 在 depth 13，默认深度 9/12 会整块截掉 → 默认改为 18。
+- ✅ 侧栏项无 title，文字在子 AXStaticText 的 value；`--text 工作台` 靠子文本命中并带出祖先 ref。
+- ✅ `shot` 的 `origin/scale`（窗口 1330×775 → 截图 1280×746，scale 1.0391）换算后 HID 点击准确；网页元素的 AX frame 可信度待逐个应用核对，优先 `click{"shot":[px,py]}` / `ocr`。
+- ⚠️ Chromium 子树惰性出现：同一棵树连续 dump 节点数递增，读树前预热（children-only）直到不再增长。
+
 ### 通用
 - ✅ axc 引擎 DSH bash 下辅助功能/屏幕录制权限全通（探针验证）。
 - ❌ swiftc 默认 module cache 路径（/var/folders）沙箱拒 → 必须 -module-cache-path 指向 workspace。

@@ -33,18 +33,25 @@ All engines implement the same subcommands and print the same line protocol:
 ```
 axc <subcommand> [flags]
   winlist [--pid N]                 -> window list: id, pid, app, title, bounds
-  axtree --pid N [--win I] [--depth D] [--max N] [--clickable] [--text S] [--menu]
-                                    -> [ref] role t=title v=value [FOCUS]
+  axtree --pid N [--win I] [--depth D] [--max N] [--clickable] [--text S] [--menu] [--root REF]
+                                    -> [ref] role t=title v=value [ph=placeholder] [FOCUS] [press] [@cx,cy]
+                                    depth default 18 (Electron content sits at 10-14); --text searches the full
+                                    depth and prints hits (>>) + ancestors; --root dumps one subtree with refs
+                                    still numbered from the window root. Chromium trees are warmed (children-only
+                                    passes) before dumping, so lazily serialised subtrees don't go missing.
   axread --pid N --path REF         -> role/title/value/focused/actions/frame
   axact --pid N --json '[actions]'  -> per-action status lines + SUMMARY
-  shot --pid N [--out P] [--max L]  -> JPEG (long edge <= L, default 1280)
+  shot --pid N [--out P] [--max L]  -> JPEG (long edge <= L, default 1280); OK line carries
+                                       img=W×H scale=S origin=X,Y for mapping pixels -> screen
   ocr --pid N --text S [--assert-absent 1]  -> hit coordinates or ABSENT
   relaunch --app NAME [--args "…"]  -> kill (probe liveness first) + relaunch with args
 
 axact action ops (all engines):
-  press / click {x,y | target} / set {value} / type {text[,hid]} / key {spec[,hid]}
+  press / click {x,y | "shot":[px,py] | target} / set {value} / type {text[,hid]} / key {spec[,hid]}
   focus / menu {path} / select / read / frame / wait {ms} / scroll {dy}
   every op accepts verify: {path|text, contains?, wait?}  -> VERIFY FAIL aborts batch
+  clicks on web content fall back to HID automatically (click-autohid) and self-verify against
+  window / focus / screen-region change, so a click reports confirmed or unverified with a reason.
   every op accepts locate by {"path": ref} OR {"text": S, "role": R?, "nth": N}
 ```
 

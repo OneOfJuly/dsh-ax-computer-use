@@ -28,5 +28,5 @@ ax_act --pid N --json '[
 | 下拉开了但 OCR MISS | 选项不在首屏 | 加 search 参数先过滤 |
 | verify 抓到旧值 | 读回太快 | verify.wait 加到 1200 |
 | click 落空无反应 | 窗口非前台（首击被激活吃掉） | 引擎会自动 activate+重试；仍不行就手动 osascript activate |
-| AXPress 没反应 | CEF div 按钮不吃 AXPress | 一律 hid 坐标点击 |
+| AXPress 没反应 | CEF div 按钮不吃 AXPress | `press` 会自动补 HID 点击并取证；仍不响应就用 `click` + `ocr`/`shot` 坐标 |
 | 时长类字段被拦 | 单位是「天」不是显示的「小时」 | 用快捷按钮（如 8小时=1）或 read_errors 看报错原文 |

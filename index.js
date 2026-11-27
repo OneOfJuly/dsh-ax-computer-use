@@ -98,16 +98,18 @@ export function apply(ctx, _config) {
     defineTool(ctx, {
       name: 'ax_tree',
       description:
-        '读取应用的无障碍元素树：每行 = [ref] 角色 t=标题 v=值（含 FOCUS 焦点标记）。\n' +
-        '**用 --clickable 只看可交互元素，通常小很多**；用 --text 关键字过滤到目标附近再按深度展开。\n' +
+        '读取应用的无障碍元素树：每行 = [ref] 角色 t=标题 v=值（含 FOCUS 焦点标记）；无标题的可点击节点会带 press 与 @x,y 中心坐标，输入框带 ph=占位符。\n' +
+        '**用 clickable 只看可交互元素，通常小很多**；用 text 关键字做全深度搜索，只输出命中节点（>> 标记）及其祖先路径，ref 可直接用于 ax_act；\n' +
+        '网页内容很深（Electron 的 webarea 在 depth 9～10）时，用 root 指定某个 ref 只展开它的子树，避免整棵树被截断。\n' +
         '注意：动态网页（播放中视频等）索引会漂移——**操作时优先用 ax_act 的 text 定位**，别依赖长 ref。',
       parameters: {
         pid: { type: 'integer', required: true, description: '目标进程 pid（来自 ax_windows）' },
         win: { type: 'integer', description: '窗口序号（应用内第几个 AX 窗口，默认 0）' },
-        depth: { type: 'integer', description: '展开深度（默认 12）' },
+        depth: { type: 'integer', description: '展开深度（默认 18；Electron 网页内容常在 10～14 层）' },
         max: { type: 'integer', description: '最多输出节点数（默认 80）' },
         clickable: { type: 'boolean', description: '只列按钮/链接/勾选框等可交互元素' },
-        text: { type: 'string', description: '只显示标题/值含此关键字的节点及其祖先路径' },
+        text: { type: 'string', description: '全深度搜索标题/值/占位符含此关键字的节点，输出命中及其祖先路径' },
+        root: { type: 'string', description: '只展开此 ref（来自上一次 ax_tree）的子树，ref 仍按窗口根编号' },
         menu: { type: 'boolean', description: '展开菜单子树（默认修剪菜单条，省 token）' },
       },
       output: textOutput,
@@ -119,6 +121,7 @@ export function apply(ctx, _config) {
         if (args.max != null) a.push('--max', String(args.max))
         if (args.clickable) a.push('--clickable')
         if (args.text) a.push('--text', String(args.text))
+        if (args.root) a.push('--root', String(args.root))
         if (args.menu) a.push('--menu')
         const out = await run(engine, a)
         return { text: out }
@@ -133,8 +136,9 @@ export function apply(ctx, _config) {
         '定位：{"path":"1.0.0:AXCheckBox"} 或 **推荐 {"text":"提交","role":"AXButton"}**（搜文字，免疫动态页面；多处匹配用 "nth":1）。\n' +
         '动作类型：press / set{value} / type{文本,追加} / key{"cmd+a"} / focus / menu{"格式>字体>粗体"} / read / frame / click{x,y 或 ocr:"文字"} / ocr{text} / wait{ms} / scroll{dy}。\n' +
         'v2 组合 op：{"op":"dropdown","x":..,"y":..,"search":"示例","pick":"ALPHA","verify":{"text":"项目","contains":"ALPHA"}} = 开下拉→HID 输入过滤→OCR 点选→读回验证（CEF/antd 表单神器）；{"op":"remember","key":"类别","x":..,"y":..} / recall = 空间坐标缓存（表单字段位置跨会话稳定，缓存后直接点）；{"op":"read_errors"} = 扫描表单校验错误（提交后必加，报 FORM_ERROR）。\n' +
-        'click 还支持 ocr 定位（自绘 UI 神器）：{"op":"click","ocr":"搜索","hid":1} = 引擎内 Vision OCR 找文字并点其中心，一轮替代截图循环；{"op":"ocr","text":"关键词"} 列出全部命中坐标。click 可加 "verify":{"path":…,"contains":…} 内联校验。\n' +
-        '每次调用返回：逐动作状态行 + SUMMARY + FOCUS 前后 + WINDOWS 窗口变化。confirmed=已验证成功；suspected_noop=执行了但没观察到变化（换定位方式重试）。\n' +
+        'click 还支持 ocr 定位（自绘 UI 神器）：{"op":"click","ocr":"搜索"} = 引擎内 Vision OCR 找文字并点其中心，一轮替代截图循环；{"op":"ocr","text":"关键词"} 列出全部命中坐标；{"op":"click","shot":[x,y]} = 直接用 ax_shot 截图里的像素坐标（引擎按最近一次截图换算成屏幕坐标）。\n' +
+        'click/press 自带取证：hid 未指定时，坐标落在网页内容上会自动走 HID（结果标 autohid，不必手动 hid:1）；没有 verify 的 click 用 窗口变化/焦点变化/点击点附近屏幕变化 自动判定 confirmed/unverified；也可加 "verify":{"path":…,"contains":…} 内联校验。\n' +
+        '每次调用返回：逐动作状态行 + SUMMARY + FOCUS 前后 + WINDOWS 窗口变化。confirmed=已验证成功；unverified/suspected_noop=执行了但没观察到变化（用 read/ocr/shot 复核或换定位方式重试）。\n' +
         '典型流程：ax_windows → ax_tree --clickable → 一条 ax_act 批量完成 → 看 SUMMARY 决定是否需要补救动作。',
       parameters: {
         pid: { type: 'integer', required: true, description: '目标进程 pid（来自 ax_windows）' },
@@ -189,7 +193,8 @@ export function apply(ctx, _config) {
       name: 'ax_shot',
       description:
         '窗口截图（JPEG 压缩，长边默认 1280，约为原图 1/20 的 token）。\n' +
-        'AX 是主力、截图是兜底：树读不到的（自绘 canvas、验证码、纯图形界面）才用。截的是该 pid 最大可见窗口。',
+        'AX 是主力、截图是兜底：树读不到的（自绘 canvas、验证码、纯图形界面）才用。截的是该 pid 最大可见窗口。\n' +
+        '返回文本里带 img×scale×origin 映射：屏幕坐标 = origin + 图片像素 × scale；不想手算就用 ax_act 的 {"op":"click","shot":[px,py]}。',
       parameters: {
         pid: { type: 'integer', required: true, description: '目标进程 pid' },
         max: { type: 'integer', description: '长边像素上限（默认 1280）' },

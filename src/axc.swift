@@ -2,11 +2,12 @@
 //
 // Subcommands:
 //   winlist                          — on-screen windows: pid<TAB>windowId<TAB>app<TAB>title<TAB>x,y w×h
-//   axtree --pid N [--win I] [--depth D] [--max N] [--clickable] [--text S]
-//                                    — compact ref tree; refs are "idx.chain:Role" from the window root
+//   axtree --pid N [--win I] [--depth D] [--max N] [--clickable] [--text S] [--root REF]
+//                                    — compact ref tree; refs are "idx.chain:Role" from the window root;
+//                                      --text searches the full depth and prints hits + ancestors; --root dumps a subtree
 //   axread --pid N --path REF        — attributes of one element (role/title/desc/value/focused/enabled/actions)
 //   axact  --pid N --json ACTIONS    — batched verified actions; prints per-action status + summary
-//   shot   --pid N [--out F] [--max-edge N] — window screenshot via screencapture(1); prints rect line
+//   shot   --pid N [--out F] [--max N] — window screenshot via screencapture(1); prints image↔screen mapping
 //   ocr    --pid N [--text S]        — Vision OCR of the window: HIT «text» center=(x,y) lines
 //   relaunch --app NAME [--args "…"] — SIGTERM quit + `open -a` with args; prints new pid
 //
@@ -124,6 +125,25 @@ func findInTree(_ root: AXUIElement, _ text: String, _ role: String?, _ nth: Int
     return found
 }
 
+/// Chromium 按需序列化无障碍树：前几次 children 查询只返回部分子树（飞书侧栏要到第 2～3 轮才出现）。
+/// 只走 children、不读属性，直到节点数不再增长（最多 passes 轮、每轮 cap 个节点），让随后的正式 dump / 文本搜索能看到整棵树。返回最终节点数。
+@discardableResult
+func warmAX(_ root: AXUIElement, passes: Int = 2, cap: Int = 3000) -> Int {
+    func count(_ el: AXUIElement, _ depth: Int, _ visited: inout Int) {
+        if visited > cap || depth > 30 { return }
+        visited += 1
+        for k in kids(el) { count(k, depth + 1, &visited) }
+    }
+    var last = -1
+    for _ in 0..<max(1, passes) {
+        var n = 0
+        count(root, 0, &n)
+        if n <= last { return n }
+        last = n
+    }
+    return last
+}
+
 /// Resolve target from action args: "path" ref or "text"(+"role","nth") query. Searches hinted window first, then all windows.
 func resolveTarget(_ a: [String: Any], _ app: AXUIElement) throws -> AXUIElement {
     if let ref = a["path"] as? String {
@@ -145,7 +165,16 @@ func resolveTarget(_ a: [String: Any], _ app: AXUIElement) throws -> AXUIElement
     for w in order {
         if let el = findInTree(w, text, role, nth) { return el }
     }
-    throw ActError(msg: "NOT_FOUND text=«\(text)»\(role != nil ? " role=\(role!)" : "") searched \(wins.count) window(s)")
+    // Electron/Chromium 会按需开启各 WebContents 的无障碍：未激活时整块子树（如飞书侧栏）根本不在树里。
+    // 首轮找不到就踢一下渲染进程无障碍、稍等再找一轮，避免误报 NOT_FOUND。
+    kickRendererAX(app)
+    usleep(500_000)
+    let wins2 = axWindows(app)
+    for w in wins2 where hasWebArea(w) { warmAX(w) }
+    for w in wins2 {
+        if let el = findInTree(w, text, role, nth) { return el }
+    }
+    throw ActError(msg: "NOT_FOUND text=«\(text)»\(role != nil ? " role=\(role!)" : "") searched \(wins2.count) window(s)")
 }
 
 /// Build ref for a node during dump: chain of child indices from root + role.
@@ -202,21 +231,26 @@ func hasWebArea(_ el: AXUIElement, maxDepth: Int = 6, budget: Int = 300) -> Bool
     return walk(el, 0)
 }
 
+/// Kick Chromium/Electron renderer accessibility on. Errors expected on non-Electron apps; ignore.
+/// 每次读树前都调一次（开销只有两次属性写入）：Chromium 会按 WebContents 惰性开启无障碍，且一段时间没人查询就自动关掉，
+/// 表现为同一棵树时有时无（飞书侧栏就是这样消失的）。
+func kickRendererAX(_ app: AXUIElement) {
+    AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+    AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+}
+
 @discardableResult
 func ensureRendererAX(_ app: AXUIElement, pid: Int32, waitMs: Int = 6000) -> Bool {
+    kickRendererAX(app)
     // quick check first — most apps already expose web content
     let els = appWindows(app)
     if let w = els.first, hasWebArea(w) { return true }
-
-    // kick both known switches (errors expected on non-Electron apps; ignore)
-    AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-    AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
 
     let rounds = max(1, waitMs / 600)
     for i in 0..<rounds {
         usleep(600_000)
         // re-set the switch each round: some builds reset it while booting
-        AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        kickRendererAX(app)
         let els2 = appWindows(app)
         if let w = els2.first, hasWebArea(w) {
             print("AX_ACTIVATED pid=\(pid) (rounds=\(i + 1))")
@@ -228,89 +262,121 @@ func ensureRendererAX(_ app: AXUIElement, pid: Int32, waitMs: Int = 6000) -> Boo
 
 func axtree(args: [String: String]) {
     guard let pid = Int32(args["pid"] ?? "") else { print("ERR bad pid"); exit(2) }
-    let depthMax = Int(args["depth"] ?? "9") ?? 9
+    // 默认深度 18：Electron 应用（飞书等）窗口→内容→网页控件通常在 10～14 层，9/12 都会把整块侧栏和弹窗截掉
+    let depthMax = Int(args["depth"] ?? "18") ?? 18
     let nodeCap = Int(args["max"] ?? "900") ?? 900
     let clickableOnly = args["clickable"] == "1"
-    let textFilter = args["text"]
     let expandMenus = args["menu"] == "1"
+    // --text 搜索模式：不受 depth 限制全量遍历（Electron 网页内容在 depth 10+，默认深度永远搜不到），
+    // 再裁剪成「命中 + 祖先」路径；此模式忽略 clickable 过滤。
+    let textFilter = args["text"] ?? ""
+    let searchMode = !textFilter.isEmpty
+    let walkDepth = searchMode ? 30 : depthMax
+    let walkCap = searchMode ? max(nodeCap, 6000) : nodeCap
 
     let app = appElement(pid)
     // v2: shell-only tree on an Electron-ish app -> kick renderer AX before dumping
     if args["noactivate"] != "1" {
         _ = ensureRendererAX(app, pid: pid)
     }
-    var roots: [AXUIElement] = []
-    var rootTitle = ""
     let els = appWindows(app)
-    if let wi = Int(args["win"] ?? ""), wi < els.count { roots = [els[wi]]; rootTitle = strAttr(els[wi], kAXTitleAttribute) ?? "" }
-    else if !els.isEmpty { roots = [els[0]]; rootTitle = strAttr(els[0], kAXTitleAttribute) ?? "" }
-    let dumpRoot = roots.first ?? app
-    let rootLabel = rootTitle.isEmpty ? "(app)" : "win «\(esc(rootTitle, 48))»"
-
+    // Chromium 的惰性树：含网页内容的窗口先空跑几轮 children，等节点数不再增长再正式 dump，否则侧栏/弹窗会时有时无
+    if args["noactivate"] != "1" {
+        for w in els where hasWebArea(w) { warmAX(w) }
+    }
+    let explicitWin = Int(args["win"] ?? "")
+    var candidates: [(AXUIElement, String)] = []
+    if let wi = explicitWin, wi < els.count { candidates = [(els[wi], strAttr(els[wi], kAXTitleAttribute) ?? "")] }
+    else if !els.isEmpty { candidates = [(els[0], strAttr(els[0], kAXTitleAttribute) ?? "")] }
     // Cross-window text search: with a text filter and no explicit win, scan every window
     // and report the first one that yields hits (Chrome's AX window 0 is often an empty helper window).
-    let explicitWin = Int(args["win"] ?? "")
-    var candidates: [(AXUIElement, String)] = [(dumpRoot, rootTitle)]
-    if let t = textFilter, !t.isEmpty, explicitWin == nil, els.count > 1 {
+    if searchMode, explicitWin == nil, els.count > 1 {
         candidates = els.map { ($0, strAttr($0, kAXTitleAttribute) ?? "") }
     }
+    // --root REF: dump a subtree only. Refs stay numbered from the window root, so they work in axact as-is.
+    var startChain: [Int] = []
+    if let r = args["root"], !r.isEmpty {
+        guard let rootEl = resolve(els.first ?? app, r) else { print("ERR --root \(r) not found (re-run axtree for fresh refs)"); exit(3) }
+        candidates = [(rootEl, "subtree \(r)")]
+        startChain = r.split(separator: ":")[0].split(separator: ".").compactMap { Int($0) }
+    }
 
-    var out: [String] = []
+    var rows: [(chain: [Int], line: String)] = []
+    var hitRows: Set<Int> = []
     var count = 0
-    var truncated = false
     let focusRef = attr(app, kAXFocusedUIElementAttribute).flatMap { CFGetTypeID($0) == AXUIElementGetTypeID() ? ($0 as! AXUIElement) : nil }
     var focusChain: [Int] = []
+    let indent = { (d: Int) in String(repeating: " ", count: d * 2) }
+    // 截断判定用 count > walkCap（嵌套函数里改 var 会让编译器误报“永不为真”）
+    func truncated() -> Bool { count > walkCap }
 
     func dump(_ el: AXUIElement, chain: [Int], depth: Int) {
-        guard !truncated else { return }
+        guard !truncated() else { return }
         count += 1
-        if count > nodeCap { out.append("!TRUNCATED (raise --max or narrow --depth)"); truncated = true; return }
+        if truncated() { return }
         let (role, label) = ident(el)
         if !expandMenus && (role == "AXMenuBar" || role == "AXMenu") {
-            out.append("\(String(repeating: " ", count: depth * 2))[\(refOf(chain, role))] \(role) …menus pruned (pass menu=1 to expand)")
+            rows.append((chain, "\(indent(depth))[\(refOf(chain, role))] \(role) …menus pruned (pass menu=1 to expand)"))
             return
         }
-        let value = strAttr(el, kAXValueAttribute) ?? ""
         let clickable = CLICKABLE_ROLES.contains(role)
-        let interactive = clickable || (attr(el, AXAttrActions) != nil && depth > 0 && (label.isEmpty == false))
+        let acts = attr(el, AXAttrActions) as? [String]
+        let pressable = acts?.contains("AXPress") ?? false
+        // 无标题但可 AXPress 的节点（网页 div 按钮、antd 下拉框）同样是可交互元素——不能因为没 label 就丢掉
+        let interactive = clickable || pressable || (acts != nil && depth > 0 && !label.isEmpty)
+        // 被 --clickable 过滤掉的容器节点不打印但仍要递归；只省掉 value/占位符/坐标这几轮 AX 往返
+        let keep = searchMode || !clickableOnly || interactive
         let focused = focusRef.map { $0 == el } ?? false
         if focused { focusChain = chain }
-        let keep = !clickableOnly || interactive
         if keep {
+            let value = strAttr(el, kAXValueAttribute) ?? ""
             var parts = [role]
             if !label.isEmpty { parts.append("t=\(esc(label, 44))") }
             if !value.isEmpty, VALUE_ROLES.contains(role) || clickable { parts.append("v=\(esc(value, 56))") }
+            if role == "AXTextField" || role == "AXTextArea" || role == "AXComboBox", let ph = strAttr(el, "AXPlaceholderValue"), !ph.isEmpty {
+                parts.append("ph=\(esc(ph, 30))")
+            }
             if focused { parts.append("FOCUS") }
-            if let acts = attr(el, AXAttrActions) as? [String], acts.contains("AXPress") { parts.append("press") }
-            out.append("\(String(repeating: " ", count: depth * 2))[\(refOf(chain, role))] \(parts.joined(separator: " "))")
+            if pressable { parts.append("press") }
+            // 无标题无值的可点击节点给出中心坐标，便于区分和直接按坐标操作
+            if label.isEmpty && value.isEmpty, (pressable || clickable), let f = axFrame(el) {
+                parts.append("@\(Int(f.0 + f.2 / 2)),\(Int(f.1 + f.3 / 2))")
+            }
+            let line = "\(indent(depth))[\(refOf(chain, role))] \(parts.joined(separator: " "))"
+            if searchMode, !textFilter.isEmpty, line.localizedCaseInsensitiveContains(textFilter) { hitRows.insert(rows.count) }
+            rows.append((chain, line))
         }
-        guard depth < depthMax else { return }
+        guard depth < walkDepth else { return }
         var i = 0
         for k in kids(el) {
             var c = chain; c.append(i); i += 1
             dump(k, chain: c, depth: depth + 1)
-            if truncated { return }
+            if truncated() { return }
         }
     }
-    dump(dumpRoot, chain: [], depth: 0)
-    if let t = textFilter, !t.isEmpty {
-        // scan further windows until hits (candidates computed above)
-        var hits = out.filter { $0.contains(t) }
-        if hits.isEmpty && candidates.count > 1 && explicitWin == nil {
-            for (rootEl, _) in candidates.dropFirst() {
-                out = []
-                count = 0
-                truncated = false
-                focusChain = []
-                dump(rootEl, chain: [], depth: 0)
-                hits = out.filter { $0.contains(t) }
-                if !hits.isEmpty { break }
-            }
+
+    for (rootEl, _) in candidates {
+        rows = []; hitRows = []; count = 0; focusChain = []
+        dump(rootEl, chain: startChain, depth: 0)
+        if searchMode, !hitRows.isEmpty { break }
+    }
+
+    if searchMode {
+        // 裁剪：命中行 + 其全部祖先，保持 DFS 顺序，命中行用 >> 标记
+        var keepSet = Set<String>()
+        for hi in hitRows {
+            let c = rows[hi].chain
+            for n in 1...max(c.count, 1) { keepSet.insert(c.prefix(n).map(String.init).joined(separator: ".")) }
         }
-        print("FILTER «\(t)» hits=\(hits.count)\(candidates.count > 1 && explicitWin == nil ? " (searched \(candidates.count) windows)" : "")")
-        print(hits.prefix(60).joined(separator: "\n"))
+        print("FILTER «\(textFilter)» hits=\(hitRows.count)\(candidates.count > 1 && explicitWin == nil ? " (searched \(candidates.count) windows)" : "")")
+        var shown = 0
+        for (i, r) in rows.enumerated() where keepSet.contains(r.chain.map(String.init).joined(separator: ".")) {
+            guard shown < 120 else { print("… output capped at 120 lines (\(hitRows.count) hits)"); break }
+            print((hitRows.contains(i) ? ">> " : "   ") + r.line); shown += 1
+        }
     } else {
-        print(out.joined(separator: "\n"))
+        for r in rows { print(r.line) }
+        if truncated() { print("!TRUNCATED (raise --max or narrow --depth, or use --root/--text)") }
     }
     print("NODES \(count)\(focusChain.isEmpty ? "" : " FOCUSPATH \(focusChain.map(String.init).joined(separator: "."))")")
 }
@@ -500,9 +566,10 @@ func activateApp(_ pid: pid_t, _ app: AXUIElement) {
     }
     usleep(180000)
 }
-func postClick(_ pid: pid_t, _ x: CGFloat, _ y: CGFloat, hid: Bool = false) {
+/// beforePress: called after the hover move and before mouse-down — the moment to snapshot the "before" state
+/// for click evidence (hover styling is already applied, so it does not count as a click effect).
+func postClick(_ pid: pid_t, _ x: CGFloat, _ y: CGFloat, hid: Bool = false, beforePress: (() -> Void)? = nil) {
     let src = CGEventSource(stateID: .hidSystemState)
-    let tap: CGEventTapLocation = hid ? .cghidEventTap : .cghidEventTap
     // HID-level events go to whatever window is frontmost — verify we're about to hit the right app
     var frontWarn = ""
     if hid {
@@ -519,10 +586,11 @@ func postClick(_ pid: pid_t, _ x: CGFloat, _ y: CGFloat, hid: Bool = false) {
     frontWarnStore = frontWarn
     func fire(_ type: CGEventType, _ delay: useconds_t) {
         let e = CGEvent(mouseEventSource: src, mouseType: type, mouseCursorPosition: CGPoint(x: x, y: y), mouseButton: .left)
-        if hid { e?.post(tap: tap) } else { e?.postToPid(pid) }
+        if hid { e?.post(tap: .cghidEventTap) } else { e?.postToPid(pid) }
         usleep(delay)
     }
     fire(.mouseMoved, 40000)
+    beforePress?()
     fire(.leftMouseDown, 60000)
     fire(.leftMouseUp, 120000)
 }
@@ -551,6 +619,76 @@ func focusedSummary(_ app: AXUIElement) -> String {
     let (role, label) = ident(el)
     let v = esc(strAttr(el, kAXValueAttribute) ?? "", 40)
     return "\(role)\(label.isEmpty ? "" : " «\(esc(label, 30))»")\(v.isEmpty ? "" : " v=\(v)")"
+}
+
+// ── click evidence (auto-verification without an explicit verify) ──────────────
+
+/// Is the screen point over web content (Electron/Chromium renderer)? postToPid mouse events only move
+/// focus there; a real click needs the HID tap. Hit-test the system-wide element and walk up to an AXWebArea.
+func pointUnderWeb(_ x: CGFloat, _ y: CGFloat) -> Bool {
+    var hit: AXUIElement?
+    let r = AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(x), Float(y), &hit)
+    guard r == .success, let el = hit else { return false }
+    return underWebArea(el)
+}
+
+/// Grey 64×32 thumbnail of a screen region (via screencapture -R), used to compare before/after a click.
+func regionThumb(_ r: CGRect) -> [UInt8]? {
+    let tmp = "/tmp/axc-reg-\(getpid()).png"
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    task.arguments = ["-o", "-x", "-R", "\(Int(r.minX)),\(Int(r.minY)),\(Int(r.width)),\(Int(r.height))", tmp]
+    try? task.run()
+    task.waitUntilExit()
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    guard task.terminationStatus == 0, let img = NSImage(contentsOfFile: tmp),
+          let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+    let w = 64, h = 32
+    guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w,
+                              space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return nil }
+    ctx.interpolationQuality = .medium
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+    guard let d = ctx.data else { return nil }
+    return Array(UnsafeBufferPointer(start: d.assumingMemoryBound(to: UInt8.self), count: w * h))
+}
+
+/// Fraction of thumbnail pixels whose grey level moved by more than 24.
+func thumbDiff(_ a: [UInt8], _ b: [UInt8]) -> Double {
+    guard a.count == b.count, !a.isEmpty else { return 0 }
+    var n = 0
+    for i in 0..<a.count where abs(Int(a[i]) - Int(b[i])) > 24 { n += 1 }
+    return Double(n) / Double(a.count)
+}
+
+/// Evidence region around a click point: 120×60 pt — a 1px selection border registers, a blinking caret does not.
+func evidenceRect(_ cx: CGFloat, _ cy: CGFloat) -> CGRect {
+    CGRect(x: cx - 60, y: cy - 30, width: 120, height: 60)
+}
+
+/// After a click: window list change / focus change / screen change near the point → "confirmed (…)"; else "unverified (…)".
+func clickEvidence(_ app: AXUIElement, focusBefore: String, winBefore: [Int: String], thumbBefore: [UInt8]?, rect: CGRect) -> String {
+    usleep(300000)
+    let wd = winDiff(winBefore, windowSnapshot())
+    if !wd.hasPrefix("WINDOWS unchanged") { return "confirmed (\(wd))" }
+    let fa = focusedSummary(app)
+    if fa != focusBefore { return "confirmed (focus → \(fa))" }
+    if let tb = thumbBefore, let ta = regionThumb(rect) {
+        let d = thumbDiff(tb, ta)
+        if d > 0.015 { return String(format: "confirmed (screen near click changed %.1f%%)", d * 100) }
+    }
+    return "unverified (no observable change — verify via read/ocr/shot)\(frontWarnStore)"
+}
+
+// ── last screenshot bookkeeping: lets click{"shot":[px,py]} use image pixel coords ──
+// 放 /tmp（按 uid 隔离）：它只在同一次会话内有意义，且 /tmp 在任何运行环境下都可写。
+
+var lastShotURL: URL { URL(fileURLWithPath: "/tmp/axc-lastshot-\(getuid()).json") }
+
+struct ShotMeta: Decodable { let pid: Int32; let x: Double; let y: Double; let w: Double; let h: Double; let iw: Double; let ih: Double }
+
+func loadShotMeta(_ pid: Int32) -> ShotMeta? {
+    guard let d = try? Data(contentsOf: lastShotURL), let m = try? JSONDecoder().decode(ShotMeta.self, from: d), m.pid == pid else { return nil }
+    return m
 }
 
 // ── menu navigation ───────────────────────────────────────────────────────────
@@ -686,6 +824,13 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
         }
         // Fallback 2 / normal path: perform AXPress even if not advertised (Chromium often supports it silently)
         guard let actName = act ?? "AXPress" as String? else { throw ActError(msg: "unreachable") }
+        // Web content: snapshot before AXPress so its effect can be measured; HID click is the fallback, not a blind double-fire.
+        let web = underWebArea(el)
+        let center = axFrame(el).map { (x: $0.0 + $0.2 / 2, y: $0.1 + $0.3 / 2) }
+        let winBefore = windowSnapshot()
+        let focusBefore = focusedSummary(app)
+        var thumbBefore: [UInt8]? = nil
+        if web, let c = center { thumbBefore = regionThumb(evidenceRect(c.x, c.y)) }
         let r = AXUIElementPerformAction(el, actName as CFString)
         guard r == .success else { throw ActError(msg: "AX action \(actName) failed code=\(r.rawValue) (advertised: \(actions.joined(separator: ",")))") }
         usleep(250000)
@@ -693,17 +838,20 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
         let focusNow = focusedSummary(app)
         if stateAfter != stateBefore { return "OK confirmed \(idx)press \(role) «\(esc(label, 30))» (value changed)" }
         if winSnapshotChanged() { return "OK confirmed \(idx)press \(role) «\(esc(label, 30))» (window changed)" }
-        if underWebArea(el) {
-            // postToPid clicks don't reach Chromium renderers — degrade to HID-level click (brief real-cursor hijack)
-            if let f = axFrame(el) {
-                let cx = f.0 + f.2 / 2, cy = f.1 + f.3 / 2
+        if web {
+            if let c = center {
+                // screen changed right after AXPress = the press took effect; a HID click now would be a double-fire
+                if let tb = thumbBefore, let ta = regionThumb(evidenceRect(c.x, c.y)), thumbDiff(tb, ta) > 0.015 {
+                    return "OK confirmed \(idx)press \(role) «\(esc(label, 30))» via AXPress (screen changed near element)"
+                }
+                // postToPid clicks don't reach Chromium renderers — degrade to HID-level click (brief real-cursor hijack)
                 if (a["activate"] as? Int) != 0 { activateApp(pid, app) }
-                postClick(pid, cx, cy, hid: true)
-                usleep(250000)
+                var thumbHid: [UInt8]? = nil
+                postClick(pid, c.x, c.y, hid: true) { thumbHid = regionThumb(evidenceRect(c.x, c.y)) }
                 let v2 = strAttr(el, kAXValueAttribute) ?? ""
-                if v2 != stateBefore { return "OK confirmed \(idx)press \(role) «\(esc(label, 30))» via hid-click@(\(Int(cx)),\(Int(cy))) (value → \(esc(v2, 20)))\(frontWarnStore)" }
-                let hint = isFocused(el) ? "click landed, effect unproven; verify via read/screenshot" : "no observable proof; verify via read/screenshot"
-                return "OK unverified \(idx)press \(role) «\(esc(label, 30))» — web: AXPress accepted, hid-click@(\(Int(cx)),\(Int(cy))) sent; \(hint)\(frontWarnStore)"
+                if v2 != stateBefore { return "OK confirmed \(idx)press \(role) «\(esc(label, 30))» via hid-click@(\(Int(c.x)),\(Int(c.y))) (value → \(esc(v2, 20)))\(frontWarnStore)" }
+                let verdict = clickEvidence(app, focusBefore: focusBefore, winBefore: winBefore, thumbBefore: thumbHid, rect: evidenceRect(c.x, c.y))
+                return "OK \(verdict) \(idx)press \(role) «\(esc(label, 30))» — web: AXPress accepted, hid-click@(\(Int(c.x)),\(Int(c.y))) sent\(frontWarnStore)"
             }
             let hint = isFocused(el) ? "only focus moved (renderer AX may be partial; verify via read/screenshot, or relaunch with --force-renderer-accessibility, or use click{x,y})" : "no observable proof"
             return "OK unverified \(idx)press \(role) «\(esc(label, 30))» — web element: \(hint)"
@@ -807,6 +955,11 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
         } else if let x = a["x"] as? Int, let y = a["y"] as? Int {
             cx = CGFloat(x); cy = CGFloat(y)
             what = "@(\(x),\(y))"
+        } else if let s = a["shot"] as? [Double], s.count == 2 {
+            // pixel coords inside the last ax_shot image of this pid → screen points (no manual scale math)
+            guard let m = loadShotMeta(pid) else { throw ActError(msg: "shot coords need a prior successful shot of pid \(pid)") }
+            cx = m.x + CGFloat(s[0]) * CGFloat(m.w / m.iw); cy = m.y + CGFloat(s[1]) * CGFloat(m.h / m.ih)
+            what = "shot(\(Int(s[0])),\(Int(s[1])))→@(\(Int(cx)),\(Int(cy)))"
         } else {
             let el = try resolveTarget(a, app)
             guard let f = axFrame(el) else { throw ActError(msg: "no frame for target") }
@@ -815,8 +968,15 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
             what = "\(r2) «\(esc(l2, 20))»@(\(Int(cx)),\(Int(cy)))"
         }
         if (a["activate"] as? Int) != 0 { activateApp(pid, app) }
-        let hid = (a["hid"] as? Int) == 1
-        postClick(pid, cx, cy, hid: hid)
+        // hid 未显式指定时自动判定：坐标落在网页渲染层就走 HID（postToPid 对 Chromium 只移焦点不触发点击）
+        var hid = (a["hid"] as? Int) == 1
+        var how = hid ? "-hid" : ""
+        if a["hid"] == nil, pointUnderWeb(cx, cy) { hid = true; how = "-autohid" }
+        let focusBefore = focusedSummary(app)
+        let winBefore = windowSnapshot()
+        let rect = evidenceRect(cx, cy)
+        var thumbBefore: [UInt8]? = nil
+        postClick(pid, cx, cy, hid: hid) { thumbBefore = regionThumb(rect) }
         // optional inline verification: {"verify":{"path":"…:AXTextField","contains":"实施"}}
         // or {"verify":{"text":"实施项目"}} — element value must contain `contains` (or be non-empty without it)
         if let vf = a["verify"] as? [String: Any] {
@@ -828,18 +988,19 @@ func perform(_ app: AXUIElement, _ pid: pid_t, _ op: String, _ a: [String: Any])
             let want = vf["contains"] as? String
             if let w = want {
                 guard v.localizedCaseInsensitiveContains(w) else {
-                    throw ActError(msg: "VERIFY FAIL click\(hid ? "-hid" : "") \(what): got v=«\(esc(v, 60))» expected contains «\(w)» — abort to prevent chained wrong clicks")
+                    throw ActError(msg: "VERIFY FAIL click\(how) \(what): got v=«\(esc(v, 60))» expected contains «\(w)» — abort to prevent chained wrong clicks")
                 }
-                return "OK confirmed \(idx)click\(hid ? "-hid" : "") \(what) verified v contains «\(w)»"
+                return "OK confirmed \(idx)click\(how) \(what) verified v contains «\(w)»"
             } else {
                 guard !v.isEmpty else {
-                    throw ActError(msg: "VERIFY FAIL click\(hid ? "-hid" : "") \(what): field still empty — abort")
+                    throw ActError(msg: "VERIFY FAIL click\(how) \(what): field still empty — abort")
                 }
-                return "OK confirmed \(idx)click\(hid ? "-hid" : "") \(what) verified v=«\(esc(v, 60))»"
+                return "OK confirmed \(idx)click\(how) \(what) verified v=«\(esc(v, 60))»"
             }
         }
-        let focusNow = focusedSummary(app)
-        return "OK unverified \(idx)click\(hid ? "-hid" : "") \(what) focused=\(focusNow)\(frontWarnStore)"
+        // no explicit verify: auto-evidence (window / focus / screen near the click)
+        let verdict = clickEvidence(app, focusBefore: focusBefore, winBefore: winBefore, thumbBefore: thumbBefore, rect: rect)
+        return "OK \(verdict) \(idx)click\(how) \(what) focused=\(focusedSummary(app))\(frontWarnStore)"
     case "rightclick":
         var rx: CGFloat = 0, ry: CGFloat = 0
         if let x = a["x"] as? Int, let y = a["y"] as? Int {
@@ -1131,7 +1292,26 @@ func shot(args: [String: String]) {
     guard conv.terminationStatus == 0 else { print("ERR sips exit \(conv.terminationStatus)"); exit(1) }
     let attrs = try? FileManager.default.attributesOfItem(atPath: out)
     let size = (attrs?[.size] as? Int) ?? 0
-    print("OK \(out) \(size / 1024)KB win=\(winId) area=\(Int(bounds.width * bounds.height)) jpeg q80 max=\(maxEdge)")
+    // image↔screen mapping: screen = origin + px × scale; also persisted so click{"shot":[px,py]} can convert for us.
+    // 像素尺寸必须用 CGImageSource 读：NSImage.size 按 DPI 折算成点（144dpi 的 1280px 图会报 640）。
+    var map = ""
+    var iw = 0.0, ih = 0.0
+    if let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: out) as CFURL, nil),
+       let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] {
+        iw = (props[kCGImagePropertyPixelWidth] as? Double) ?? 0
+        ih = (props[kCGImagePropertyPixelHeight] as? Double) ?? 0
+    }
+    if iw > 0, ih > 0 {
+        let sx = bounds.width / iw
+        let meta: [String: Any] = ["pid": pid, "x": bounds.origin.x, "y": bounds.origin.y, "w": bounds.width, "h": bounds.height, "iw": iw, "ih": ih]
+        var saved = ""
+        do {
+            try JSONSerialization.data(withJSONObject: meta).write(to: lastShotURL)
+        } catch { saved = " (meta not saved: \(error.localizedDescription) — click{\"shot\":…} unavailable)" }
+        map = String(format: " img=%.0f×%.0f scale=%.4f origin=%.0f,%.0f (screen = origin + px×scale, or click{\"shot\":[px,py]})%@",
+                     iw, ih, sx, bounds.origin.x, bounds.origin.y, saved)
+    }
+    print("OK \(out) \(size / 1024)KB win=\(winId) area=\(Int(bounds.width * bounds.height)) jpeg q80 max=\(maxEdge)\(map)")
 }
 
 // ── relaunch ──────────────────────────────────────────────────────────────────
