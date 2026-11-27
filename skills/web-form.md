@@ -44,7 +44,7 @@ Step by step:
 | Symptom | Cause | What happens now |
 |---|---|---|
 | `VERIFY FAIL ... got v=«» expected contains «X»` | dropdown never opened | chain aborts at that step; retry the open-click |
-| `VERIFY FAIL ... got v=«GAMMA-…» expected «HA»` | item order shifted | chain aborts; re-screenshot, click the right row |
+| `VERIFY FAIL ... got v=«BETA-…» expected «ALPHA»` | item order shifted | chain aborts; re-screenshot, click the right row |
 | click lands but nothing happens | CEF frame offset | you used a path/frame click — switch to screenshot coords |
 | modal drifted 30px since last session | dynamic layout | verify catches the wrong pick; coords from a fresh screenshot fix it |
 
