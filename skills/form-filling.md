@@ -2,6 +2,7 @@
 
 适用：飞书工时、内部业务系统、任何 antd/element 类 React 表单。
 核心循环：**批量动作 → verify 内联校验 → read_errors → SUMMARY 判断**。
+三平台通用（macOS AX / Windows UIA / Linux AT-SPI2）——同一份 axact JSON 在哪个引擎上都能跑。
 
 ## 标准流程（一轮 axact 完成主填报）
 

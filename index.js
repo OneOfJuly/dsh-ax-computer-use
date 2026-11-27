@@ -135,7 +135,7 @@ export function apply(ctx, _config) {
         '这是比视觉循环快 10 倍的关键：把「填表单+点提交+验证」打包成一个 actions 数组。\n' +
         '定位：{"path":"1.0.0:AXCheckBox"} 或 **推荐 {"text":"提交","role":"AXButton"}**（搜文字，免疫动态页面；多处匹配用 "nth":1）。\n' +
         '动作类型：press / set{value} / type{文本,追加} / key{"cmd+a"} / focus / menu{"格式>字体>粗体"} / read / frame / click{x,y 或 ocr:"文字"} / ocr{text} / wait{ms} / scroll{dy}。\n' +
-        'v2 组合 op：{"op":"dropdown","x":..,"y":..,"search":"示例","pick":"ALPHA","verify":{"text":"项目","contains":"ALPHA"}} = 开下拉→HID 输入过滤→OCR 点选→读回验证（CEF/antd 表单神器）；{"op":"remember","key":"类别","x":..,"y":..} / recall = 空间坐标缓存（表单字段位置跨会话稳定，缓存后直接点）；{"op":"read_errors"} = 扫描表单校验错误（提交后必加，报 FORM_ERROR）。\n' +
+        'v2 组合 op（三平台引擎统一支持）：{"op":"dropdown","x":..,"y":..,"search":"示例","pick":"ALPHA","verify":{"text":"项目","contains":"ALPHA"}} = 开下拉→HID 输入过滤→OCR 点选→读回验证（CEF/antd 表单神器）；{"op":"remember","key":"类别","x":..,"y":..} / recall = 空间坐标缓存（表单字段位置跨会话稳定，缓存后直接点）；{"op":"read_errors"} = 扫描表单校验错误（提交后必加，报 FORM_ERROR）。\n' +
         'click 还支持 ocr 定位（自绘 UI 神器）：{"op":"click","ocr":"搜索"} = 引擎内 Vision OCR 找文字并点其中心，一轮替代截图循环；{"op":"ocr","text":"关键词"} 列出全部命中坐标；{"op":"click","shot":[x,y]} = 直接用 ax_shot 截图里的像素坐标（引擎按最近一次截图换算成屏幕坐标）。\n' +
         'click/press 自带取证：hid 未指定时，坐标落在网页内容上会自动走 HID（结果标 autohid，不必手动 hid:1）；没有 verify 的 click 用 窗口变化/焦点变化/点击点附近屏幕变化 自动判定 confirmed/unverified；也可加 "verify":{"path":…,"contains":…} 内联校验。\n' +
         '每次调用返回：逐动作状态行 + SUMMARY + FOCUS 前后 + WINDOWS 窗口变化。confirmed=已验证成功；unverified/suspected_noop=执行了但没观察到变化（用 read/ocr/shot 复核或换定位方式重试）。\n' +

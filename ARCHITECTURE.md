@@ -53,6 +53,23 @@ axact action ops (all engines):
   clicks on web content fall back to HID automatically (click-autohid) and self-verify against
   window / focus / screen-region change, so a click reports confirmed or unverified with a reason.
   every op accepts locate by {"path": ref} OR {"text": S, "role": R?, "nth": N}
+  v2 composite ops (all engines, v0.5.0+):
+    dropdown {ocr|x,y|key, search?, pick, verify?}  -> open combobox -> HID-type filter ->
+      OCR-locate option -> click -> read-back verify (the whole CEF/antd chain in one op)
+    remember {key, x, y} / recall {key}             -> spatial cache (~/.ax-cu/cache.json, shared
+      format across engines) — form field positions are stable across sessions
+    read_errors                                     -> scan tree for form-validation strings
+      (antd/.NET/HTML5 patterns); FORM_ERROR aborts with the reason
+
+Per-engine coverage notes (honest deltas, see README platform maturity):
+  macOS  — full op set incl. menu path / select / ocr-in-act / relaunch probe; production-validated
+  Windows — click{text} via UIA hit-test + SendInput, press via Invoke/Toggle/ExpandCollapse/
+            LegacyIAccessible chain, set via ValuePattern (fallback click+ctrl+a+type), OCR via
+            Windows.Media.Ocr with word-rect coordinates, shot window-crop + MAP, scroll wheel
+  Linux   — click{text}/press/set/focus via pyatspi walk + doAction/setTextContents (xdotool
+            fallbacks), tesseract TSV coordinates, wmctrl winlist, shot MAP; no menu-path op
+            (GNOME menus expose AXMenu — planned), hid flag for type/key is a no-op (xdotool is
+            already X-server level, reaches Chromium)
 ```
 
 Action result lines (identical grammar on every platform):

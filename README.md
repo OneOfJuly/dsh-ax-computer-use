@@ -74,7 +74,7 @@ Requirements:
 - Windows: no special setup (UIA is unrestricted; OCR needs a Windows language pack).
 - Linux: enable accessibility (GNOME: Settings → Accessibility, or `gsettings set org.gnome.desktop.interface toolkit-accessibility true`).
 
-> **Platform maturity**: macOS = fully validated in production use. Windows/Linux engines implement the full contract (see [ARCHITECTURE.md](ARCHITECTURE.md)) but are awaiting first on-device validation — bug reports welcome.
+> **Platform maturity**: macOS = fully validated in production use. Windows/Linux engines implement the **full v2 op set** (verified click/press/set/focus, dropdown/search composites, remember/recall spatial cache, read_errors, OCR with coordinates, shot MAP mapping, scroll) but are code-reviewed only — awaiting first on-device validation (Linux engine passes `py_compile` + offline op smoke tests; Windows engine gets a full `pwsh` parse check + CI-grade review). Bug reports welcome.
 
 ## Architecture
 
