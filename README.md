@@ -54,6 +54,7 @@ Measured on real tasks: a form-filling workflow in a CEF-based enterprise web ap
 
 - **Native apps** (all 3 OS): full a11y-tree read/write — AX on macOS, UI Automation on Windows, AT-SPI2 on Linux. `AXSetValue`-style writes land in ~8 ms with read-back confirmation. Menus, toolbar checkboxes, text insertion all verified.
 - **Chrome / Chromium browsers**: the renderer AX tree is exposed, so web content is readable as text. Clicks that AX cannot dispatch fall through to **HID-grade hardware events** — verified opening bilibili's episode panel on a multi-window, multi-display setup.
+- **Chromium tree naps**: a flag-less browser exposes its web tree only while it is being used (by you or by AX traffic); after idle it flips off and no external polling can force it awake. The engine auto-picks the content window (`WINDOW pick=N` line), retries briefly, and tells you honestly when a `--force-renderer-accessibility` relaunch (`ax_relaunch`) is the reliable path.
 - **Electron / CEF apps that hide their AX tree** (Lark, and many other Electron-based apps): `ax_relaunch --app Lark --args "--force-renderer-accessibility"` relaunches with the renderer accessibility flag — **login preserved** — and the whole web UI becomes readable and scriptable. This is the case vision-only tools simply cannot do at all.
 
 ## Install
